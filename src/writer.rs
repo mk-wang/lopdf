@@ -1,7 +1,6 @@
 use std::fs::File;
 use std::io::{BufWriter, Result, Write};
 use std::path::Path;
-use std::vec;
 
 use super::Object::*;
 use super::{Dictionary, Document, Object, Stream, StringFormat};
@@ -247,36 +246,29 @@ impl Document {
             },
         );
         self.trailer.set("Type", Name(b"XRef".to_vec()));
-        // Update `max_id` in trailer
         self.trailer.set("Size", i64::from(self.max_id + 1));
-        // Set the size of each entry in bytes (default for PDFs is `[1 2 1]`)
-        // In our case we use `[u8, u32, u16]` for each entry
-        // to keep things simple and working at all times.
-        self.trailer.set("W", Array(vec![Integer(1), Integer(4), Integer(2)]));
-        // Note that `ASCIIHexDecode` does not work correctly,
-        // but is still useful for debugging sometimes.
-        let filter = XRefStreamFilter::None;
-        let (stream, stream_length, indexes) = Writer::create_xref_steam(xref, filter)?;
-        self.trailer.set("Index", indexes);
 
-        if filter == XRefStreamFilter::ASCIIHexDecode {
-            self.trailer.set("Filter", Name(b"ASCIIHexDecode".to_vec()));
-        } else {
-            self.trailer.remove(b"Filter");
-        }
+        let mut builder = XrefStreamBuilder::new(xref);
+        let widths = builder.calculate_optimal_widths();
+        let stream = builder.build_stream_content().map_err(std::io::Error::other)?;
+        self.trailer.set(
+            "W",
+            Array(widths.into_iter().map(|width| Integer(width as i64)).collect()),
+        );
+        self.trailer.set("Index", builder.build_index_array());
+        self.trailer.remove(b"DecodeParms");
+        self.trailer.remove(b"Filter");
+        self.trailer.remove(b"Length");
 
-        self.trailer.set("Length", stream_length as i64);
-
-        let trailer = &self.trailer;
-        let cross_reference_stream = Stream(Stream {
-            dict: trailer.clone(),
-            allows_compression: true,
-            content: stream,
-            start_position: None,
-        });
-        // Insert Cross Reference Stream as an `Object` to the end of the PDF.
-        // The `Object` is not added to `Document` because it is generated every time you save.
-        Writer::write_indirect_object(file, new_obj_id_for_crs, 0, &cross_reference_stream, xref)?;
+        let mut cross_reference_stream = Stream::new(self.trailer.clone(), stream);
+        cross_reference_stream.compress().map_err(std::io::Error::other)?;
+        Writer::write_indirect_object(
+            file,
+            new_obj_id_for_crs,
+            0,
+            &Object::Stream(cross_reference_stream),
+            xref,
+        )?;
 
         Ok(())
     }
@@ -450,13 +442,6 @@ impl IncrementalDocument {
 
 pub struct Writer;
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-pub enum XRefStreamFilter {
-    ASCIIHexDecode,
-    _FlateDecode, //this is generally a Zlib compressed Stream.
-    None,
-}
-
 impl Writer {
     fn need_separator(object: &Object) -> bool {
         matches!(*object, Null | Boolean(_) | Integer(_) | Real(_) | Reference(_))
@@ -515,82 +500,6 @@ impl Writer {
         Ok(())
     }
 
-    /// Create stream for Cross reference stream.
-    fn create_xref_steam(xref: &Xref, filter: XRefStreamFilter) -> Result<(Vec<u8>, usize, Object)> {
-        let mut xref_sections = Vec::new();
-        let mut xref_section = XrefSection::new(0);
-
-        for obj_id in 1..xref.size {
-            // If section is empty change number of starting id.
-            if xref_section.is_empty() {
-                xref_section = XrefSection::new(obj_id);
-            }
-            if let Some(entry) = xref.get(obj_id) {
-                xref_section.add_entry(entry.clone());
-            } else {
-                // Skip over but finish section if not empty
-                if !xref_section.is_empty() {
-                    xref_sections.push(xref_section);
-                    xref_section = XrefSection::new(obj_id);
-                }
-            }
-        }
-        // Print last section
-        if !xref_section.is_empty() {
-            xref_sections.push(xref_section);
-        }
-
-        let mut xref_stream = Vec::new();
-        let mut xref_index = Vec::new();
-
-        for section in xref_sections {
-            // Add indexes to list
-            xref_index.push(Integer(section.starting_id as i64));
-            xref_index.push(Integer(section.entries.len() as i64));
-            // Add entries to stream
-            for (obj_id, entry) in (section.starting_id..).zip(section.entries) {
-                match entry {
-                    XrefEntry::Free => {
-                        // Type 0
-                        xref_stream.push(0);
-                        xref_stream.extend(obj_id.to_be_bytes());
-                        xref_stream.extend(vec![0, 0]); // TODO add generation number
-                    }
-                    XrefEntry::UnusableFree => {
-                        // Type 0
-                        xref_stream.push(0);
-                        xref_stream.extend(obj_id.to_be_bytes());
-                        xref_stream.extend(65535_u16.to_be_bytes());
-                    }
-                    XrefEntry::Normal { offset, generation } => {
-                        // Type 1
-                        xref_stream.push(1);
-                        xref_stream.extend(offset.to_be_bytes());
-                        xref_stream.extend(generation.to_be_bytes());
-                    }
-                    XrefEntry::Compressed { container, index } => {
-                        // Type 2
-                        xref_stream.push(2);
-                        xref_stream.extend(container.to_be_bytes());
-                        xref_stream.extend(index.to_be_bytes());
-                    }
-                }
-            }
-        }
-
-        // The end of line character should not be counted, added later.
-        let stream_length = xref_stream.len();
-
-        if filter == XRefStreamFilter::ASCIIHexDecode {
-            xref_stream = xref_stream
-                .iter()
-                .flat_map(|c| format!("{c:02X}").as_bytes().to_vec())
-                .collect::<Vec<u8>>();
-        }
-
-        Ok((xref_stream, stream_length, Array(xref_index)))
-    }
-
     fn write_indirect_object<W: Write>(
         file: &mut CountingWrite<&mut W>, id: u32, generation: u16, object: &Object, xref: &mut Xref,
     ) -> Result<()> {
@@ -634,6 +543,59 @@ impl Writer {
             Object::Stream(stream) => Writer::write_stream(file, stream),
             Reference(id) => write!(file, "{} {} R", id.0, id.1),
         }
+    }
+    pub(crate) fn write_object_minified(file: &mut dyn Write, object: &Object) -> Result<()> {
+        match object {
+            String(text, _) => {
+                let mut unmatched_closes = 0usize;
+                let mut open_parentheses = 0usize;
+                let mut escaped_bytes = 0usize;
+                for byte in text {
+                    match byte {
+                        b'(' => open_parentheses += 1,
+                        b')' if open_parentheses > 0 => open_parentheses -= 1,
+                        b')' => unmatched_closes += 1,
+                        b'\\' | b'\r' => escaped_bytes += 1,
+                        _ => {}
+                    }
+                }
+                let literal_len = text.len() + open_parentheses + unmatched_closes + escaped_bytes + 2;
+                let hexadecimal_len = text.len().saturating_mul(2).saturating_add(2);
+                let format = if literal_len <= hexadecimal_len {
+                    StringFormat::Literal
+                } else {
+                    StringFormat::Hexadecimal
+                };
+                Writer::write_string(file, text, &format)
+            }
+            Array(array) => Writer::write_array_minified(file, array),
+            Object::Dictionary(dictionary) => {
+                file.write_all(b"<<")?;
+                for (key, value) in dictionary {
+                    Writer::write_name(file, key)?;
+                    if Writer::need_separator(value) {
+                        file.write_all(b" ")?;
+                    }
+                    Writer::write_object_minified(file, value)?;
+                }
+                file.write_all(b">>")
+            }
+            _ => Writer::write_object(file, object),
+        }
+    }
+
+    fn write_array_minified(file: &mut dyn Write, array: &[Object]) -> Result<()> {
+        file.write_all(b"[")?;
+        let mut first = true;
+        for object in array {
+            if first {
+                first = false;
+            } else if Writer::need_separator(object) {
+                file.write_all(b" ")?;
+            }
+            Writer::write_object_minified(file, object)?;
+        }
+        file.write_all(b"]")
     }
 
     fn write_name(file: &mut dyn Write, name: &[u8]) -> Result<()> {

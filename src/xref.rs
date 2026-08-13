@@ -294,8 +294,7 @@ impl<'a> XrefStreamBuilder<'a> {
                 Object::Integer(self.widths[1] as i64),
                 Object::Integer(self.widths[2] as i64),
             ],
-            "Index" => self.build_index_array(),
-            "Filter" => "FlateDecode"
+            "Index" => self.build_index_array()
         };
 
         let mut stream = Stream::new(dict, content);

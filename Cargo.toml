@@ -28,6 +28,7 @@ ecb = "0.2"
 encoding_rs = "0.8"
 flate2 = "1.1"
 image = { version = "0.25", optional = true }
+jpeg-encoder = { version = "0.7", optional = true }
 indexmap = "2.14"
 itoa = "1.0"
 jiff = { version = "0.2", optional = true }
@@ -39,6 +40,7 @@ rand = { version = "0.10" }
 rangemap = "1.7"
 rayon = { version = "1.12", optional = true }
 serde = { version = "1.0", features = ["derive"], optional = true }
+subsetter = { version = "0.2.6", optional = true }
 sha2 = "0.11"
 stringprep = "0.1.5"
 thiserror = "2.0"
@@ -69,8 +71,9 @@ chrono = ["dep:chrono"]
 # The system-local conversions, and the iana-time-zone subtree they need.
 chrono-clock = ["chrono", "chrono/clock"]
 default = ["chrono-clock", "rayon"]
-embed_image = ["image"]
+embed_image = ["image", "dep:jpeg-encoder"]
 font_embedding = ["dep:skrifa"]
+font_subsetting = ["dep:subsetter"]
 jiff = ["dep:jiff"]
 wasm_js = ["getrandom/wasm_js"]
 serde = ["dep:serde"]
@@ -93,6 +96,10 @@ name = "print_annotations"
 
 [[example]]
 name = "rotate"
+
+[[example]]
+name = "optimize_pdf"
+required-features = ["embed_image", "font_subsetting"]
 
 [[bench]]
 name = "datetime"

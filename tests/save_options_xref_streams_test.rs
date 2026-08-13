@@ -77,6 +77,31 @@ fn xref_streams_are_written_without_object_streams() {
     let reloaded = Document::load_mem(&buffer).unwrap();
     assert_eq!(reloaded.get_pages().len(), 1, "the saved document should still load");
 }
+#[test]
+fn xref_streams_use_optimal_widths_and_flate_when_smaller() {
+    let mut doc = sample_document();
+    for _ in 0..64 {
+        doc.add_object(Object::string_literal(vec![b'x'; 512]));
+    }
+    let options = SaveOptions::builder()
+        .use_object_streams(false)
+        .use_xref_streams(true)
+        .build();
+    let mut buffer = Vec::new();
+
+    doc.save_with_options(&mut buffer, options).unwrap();
+
+    let reloaded = Document::load_mem(&buffer).unwrap();
+    assert_eq!(reloaded.get_pages().len(), 1);
+    assert!(
+        contains(&buffer, b"/W[1 2 1]") || contains(&buffer, b"/W [1 2 1]"),
+        "small offsets and zero generations need only [1 2 1] xref fields"
+    );
+    assert!(
+        contains(&buffer, b"/Filter/FlateDecode") || contains(&buffer, b"/Filter /FlateDecode"),
+        "the xref stream should be compressed when compression offsets its dictionary entry"
+    );
+}
 
 #[test]
 fn cross_reference_table_is_kept_when_xref_streams_are_not_requested() {
