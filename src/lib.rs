@@ -33,6 +33,7 @@ mod parser;
 mod parser_aux;
 mod reader;
 mod save_options;
+mod stream_bounds;
 
 #[cfg(feature = "font_embedding")]
 mod font;

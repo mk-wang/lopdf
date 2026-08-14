@@ -11,6 +11,7 @@ impl Document {
     /// Save PDF document to specified file path.
     #[inline]
     pub fn save<P: AsRef<Path>>(&mut self, path: P) -> Result<File> {
+        self.validate_for_save()?;
         let mut file = BufWriter::new(File::create(path)?);
         self.save_internal(&mut file)?;
         Ok(file.into_inner()?)
@@ -19,6 +20,7 @@ impl Document {
     /// Save PDF to arbitrary target
     #[inline]
     pub fn save_to<W: Write>(&mut self, target: &mut W) -> Result<()> {
+        self.validate_for_save()?;
         self.save_internal(target)
     }
 
@@ -27,6 +29,13 @@ impl Document {
     /// Object streams are skipped for an encrypted document, which is written with every
     /// object serialized individually instead. See [`Document::save_modern`].
     pub fn save_with_options<W: Write>(&mut self, target: &mut W, options: crate::SaveOptions) -> Result<()> {
+        let use_xref_streams = options.use_xref_streams
+            || matches!(
+                self.reference_table.cross_reference_type,
+                XrefType::CrossReferenceStream
+            );
+        let use_object_streams = options.use_object_streams && !self.is_encrypted();
+        self.validate_for_save_with_reservation(use_object_streams, use_xref_streams, &options.object_stream_config)?;
         // Cross-reference streams are independent of object streams: a document can use one
         // without the other. Select the requested type here so the choice applies whichever
         // path writes the body below. Both features arrived in PDF 1.5, so a document that is
@@ -44,6 +53,62 @@ impl Document {
         } else {
             self.save_internal(target)
         }
+    }
+
+    fn validate_for_save(&self) -> Result<()> {
+        let use_xref_streams = matches!(
+            self.reference_table.cross_reference_type,
+            XrefType::CrossReferenceStream
+        );
+        self.validate_for_save_with_reservation(false, use_xref_streams, &crate::ObjectStreamConfig::default())
+    }
+
+    fn validate_for_save_with_reservation(
+        &self, use_object_streams: bool, use_xref_streams: bool, object_stream_config: &crate::ObjectStreamConfig,
+    ) -> Result<()> {
+        Writer::validate_binary_mark(&self.binary_mark)?;
+        for object in self.objects.values() {
+            Writer::validate_object(object)?;
+        }
+
+        let object_stream_count = if use_object_streams {
+            self.count_object_streams(object_stream_config)?
+        } else {
+            0
+        };
+        let reserved = object_stream_count
+            .checked_add(u32::from(use_xref_streams))
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "maximum object ID is too large"))?;
+        self.max_id
+            .checked_add(reserved)
+            .and_then(|id| id.checked_add(1))
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "maximum object ID is too large"))?;
+        Ok(())
+    }
+
+    fn count_object_streams(&self, config: &crate::ObjectStreamConfig) -> Result<u32> {
+        use crate::ObjectStream;
+
+        let mut stream_count = 0_u32;
+        let mut objects_in_stream = 0_usize;
+        for (&(id, generation), object) in &self.objects {
+            if let Object::Stream(stream) = object
+                && stream.dict.get(b"Type").and_then(Object::as_name).ok() == Some(b"ObjStm")
+            {
+                continue;
+            }
+            if generation != 0 || !ObjectStream::can_be_compressed((id, generation), object, self) {
+                continue;
+            }
+            if objects_in_stream == 0 || objects_in_stream >= config.max_objects_per_stream {
+                stream_count = stream_count
+                    .checked_add(1)
+                    .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "too many object streams"))?;
+                objects_in_stream = 0;
+            }
+            objects_in_stream = objects_in_stream.saturating_add(1);
+        }
+        Ok(stream_count)
     }
 
     /// Save PDF with modern features (object streams and cross-reference streams)
@@ -94,7 +159,7 @@ impl Document {
             }
             XrefType::CrossReferenceStream => {
                 // Cross Reference Stream instead of XRef and Trailer
-                self.write_cross_reference_stream(&mut target, &mut xref, xref_start as u32)?;
+                self.write_cross_reference_stream(&mut target, &mut xref, Writer::xref_offset(xref_start)?)?;
             }
         }
         // Write `startxref` part of trailer
@@ -184,9 +249,15 @@ impl Document {
         }
 
         // Write object streams
-        let mut stream_count = 0;
+        let mut stream_count = 0_u32;
         for obj_stream in object_streams.into_iter() {
-            let stream_id = self.max_id + 1 + stream_count;
+            let stream_id = self
+                .max_id
+                .checked_add(1)
+                .and_then(|id| id.checked_add(stream_count))
+                .ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, "maximum object ID is too large")
+                })?;
             let stream_obj = obj_stream.to_stream_object().map_err(std::io::Error::other)?;
 
             // Record compressed objects in xref
@@ -194,11 +265,14 @@ impl Document {
             let mut sorted_objects: Vec<_> = obj_stream.objects.keys().cloned().collect();
             sorted_objects.sort_by_key(|id| *id);
             for (index_in_stream, (obj_id, _gen)) in sorted_objects.iter().enumerate() {
+                let index = u16::try_from(index_in_stream).map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, "object stream index is too large")
+                })?;
                 xref.insert(
                     *obj_id,
                     XrefEntry::Compressed {
                         container: stream_id,
-                        index: index_in_stream as u16,
+                        index,
                     },
                 );
             }
@@ -209,7 +283,10 @@ impl Document {
         }
 
         // Update max_id to account for object streams
-        self.max_id += stream_count;
+        self.max_id = self
+            .max_id
+            .checked_add(stream_count)
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "maximum object ID is too large"))?;
 
         let xref_start = target.bytes_written;
 
@@ -220,7 +297,7 @@ impl Document {
                 self.write_trailer(&mut target)?;
             }
             XrefType::CrossReferenceStream => {
-                self.write_cross_reference_stream(&mut target, &mut xref, xref_start as u32)?;
+                self.write_cross_reference_stream(&mut target, &mut xref, Writer::xref_offset(xref_start)?)?;
             }
         }
 
@@ -235,9 +312,16 @@ impl Document {
     fn write_cross_reference_stream<W: Write>(
         &mut self, file: &mut CountingWrite<&mut W>, xref: &mut Xref, xref_start: u32,
     ) -> Result<()> {
-        // Increment max_id to account for CRS.
-        self.max_id += 1;
-        let new_obj_id_for_crs = self.max_id;
+        // Reserve the cross-reference stream object and the resulting /Size
+        // value without allowing a crafted max object number to wrap.
+        let new_obj_id_for_crs = self
+            .max_id
+            .checked_add(1)
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "maximum object ID is too large"))?;
+        let size = new_obj_id_for_crs
+            .checked_add(1)
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "maximum object ID is too large"))?;
+        self.max_id = new_obj_id_for_crs;
         xref.insert(
             new_obj_id_for_crs,
             XrefEntry::Normal {
@@ -246,7 +330,7 @@ impl Document {
             },
         );
         self.trailer.set("Type", Name(b"XRef".to_vec()));
-        self.trailer.set("Size", i64::from(self.max_id + 1));
+        self.trailer.set("Size", i64::from(size));
 
         let mut builder = XrefStreamBuilder::new(xref);
         let widths = builder.calculate_optimal_widths();
@@ -274,7 +358,11 @@ impl Document {
     }
 
     fn write_trailer(&mut self, file: &mut dyn Write) -> Result<()> {
-        self.trailer.set("Size", i64::from(self.max_id + 1));
+        let size = self
+            .max_id
+            .checked_add(1)
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "maximum object ID is too large"))?;
+        self.trailer.set("Size", i64::from(size));
         file.write_all(b"trailer\n")?;
         Writer::write_dictionary(file, &self.trailer)?;
         Ok(())
@@ -289,7 +377,7 @@ impl IncrementalDocument {
     /// previous revision) does not truncate a pre-existing file at `path`.
     #[inline]
     pub fn save<P: AsRef<Path>>(&mut self, path: P) -> Result<File> {
-        self.check_incremental_save_supported()?;
+        self.validate_incremental_save()?;
         let mut file = BufWriter::new(File::create(path)?);
         self.save_internal(&mut file)?;
         Ok(file.into_inner()?)
@@ -298,6 +386,7 @@ impl IncrementalDocument {
     /// Save PDF to arbitrary target
     #[inline]
     pub fn save_to<W: Write>(&mut self, target: &mut W) -> Result<()> {
+        self.validate_incremental_save()?;
         self.save_internal(target)
     }
 
@@ -328,8 +417,26 @@ impl IncrementalDocument {
         Ok(())
     }
 
-    fn save_internal<W: Write>(&mut self, target: &mut W) -> Result<()> {
+    /// Reserve the IDs needed by the appended revision before touching the
+    /// output. A traditional xref table needs no synthetic object, while an
+    /// xref stream allocates one additional object and therefore needs both
+    /// `max_id + 1` and the resulting `/Size` (`max_id + 2`) to fit.
+    fn validate_incremental_save(&self) -> Result<()> {
         self.check_incremental_save_supported()?;
+        let xref_stream_extra = u32::from(matches!(
+            self.get_prev_documents().reference_table.cross_reference_type,
+            XrefType::CrossReferenceStream
+        ));
+        self.new_document
+            .max_id
+            .checked_add(1)
+            .and_then(|id| id.checked_add(xref_stream_extra))
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "maximum object ID is too large"))?;
+        Ok(())
+    }
+
+    fn save_internal<W: Write>(&mut self, target: &mut W) -> Result<()> {
+        self.validate_incremental_save()?;
 
         // If the previous revision was encrypted (and successfully decrypted),
         // we need to re-encrypt every appended object with the same encryption
@@ -350,8 +457,12 @@ impl IncrementalDocument {
         target.bytes_written += prev_document_bytes.len();
 
         // Write/Append new document version.
+        let xref_size =
+            self.new_document.max_id.checked_add(1).ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "maximum object ID is too large")
+            })?;
         let mut xref = Xref::new(
-            self.new_document.max_id + 1,
+            xref_size,
             self.get_prev_documents().reference_table.cross_reference_type,
         );
 
@@ -422,8 +533,11 @@ impl IncrementalDocument {
                 }
                 XrefType::CrossReferenceStream => {
                     // Cross Reference Stream instead of XRef and Trailer
-                    self.new_document
-                        .write_cross_reference_stream(&mut target, &mut xref, xref_start as u32)?;
+                    self.new_document.write_cross_reference_stream(
+                        &mut target,
+                        &mut xref,
+                        Writer::xref_offset(xref_start)?,
+                    )?;
                 }
             }
             // Write `startxref` part of trailer
@@ -452,6 +566,45 @@ impl Writer {
             *object,
             Null | Boolean(_) | Integer(_) | Real(_) | Name(_) | Reference(_) | Object::Stream(_)
         )
+    }
+    fn xref_offset(offset: usize) -> Result<u32> {
+        u32::try_from(offset)
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "cross-reference offset is too large"))
+    }
+
+    fn validate_binary_mark(binary_mark: &[u8]) -> Result<()> {
+        if binary_mark.iter().all(|&byte| byte >= 128) {
+            Ok(())
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Invalid binary mark",
+            ))
+        }
+    }
+
+    fn validate_object(object: &Object) -> Result<()> {
+        match object {
+            Array(array) => {
+                for object in array {
+                    Self::validate_object(object)?;
+                }
+            }
+            Object::Dictionary(dictionary) => {
+                for (_, object) in dictionary.iter() {
+                    Self::validate_object(object)?;
+                }
+            }
+            Object::Stream(stream) => {
+                i64::try_from(stream.content.len())
+                    .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "stream content is too large"))?;
+                for (_, object) in stream.dict.iter() {
+                    Self::validate_object(object)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     /// Write Cross Reference Table.
@@ -493,17 +646,17 @@ impl Writer {
                 }
             }
         }
+
         // Print last section
         if !xref_section.is_empty() {
             xref_section.write_xref_section(file)?;
         }
         Ok(())
     }
-
     fn write_indirect_object<W: Write>(
         file: &mut CountingWrite<&mut W>, id: u32, generation: u16, object: &Object, xref: &mut Xref,
     ) -> Result<()> {
-        let offset = file.bytes_written as u32;
+        let offset = Writer::xref_offset(file.bytes_written)?;
         xref.insert(id, XrefEntry::Normal { offset, generation });
         write!(
             file,
@@ -693,7 +846,11 @@ impl Writer {
     }
 
     fn write_stream(file: &mut dyn Write, stream: &Stream) -> Result<()> {
-        Writer::write_dictionary(file, &stream.dict)?;
+        let length = i64::try_from(stream.content.len())
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "stream content is too large"))?;
+        let mut dictionary = stream.dict.clone();
+        dictionary.set("Length", length);
+        Writer::write_dictionary(file, &dictionary)?;
         file.write_all(b"stream\n")?;
         file.write_all(&stream.content)?;
         file.write_all(b"\nendstream")?;
@@ -702,20 +859,11 @@ impl Writer {
 
     /// Write Binary mark as follows: %{binary_mark[4]}\n -> %Çì¢ or Hex(%25 c3 87 c3 ac)
     ///
-    /// Note: Specified in  ISO 19005-2:2011, ISO 19005-3:2012
-    /// headerByte1 > 127 && headerByte2 > 127 && headerByte3 > 127 && headerByte4 > 127
     fn write_binary_mark(file: &mut dyn Write, binary_mark: &[u8]) -> Result<()> {
-        if binary_mark.iter().all(|&byte| byte >= 128) {
-            file.write_all(b"%")?;
-            file.write_all(binary_mark)?;
-            file.write_all(b"\n")?;
-        } else {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "Invalid binary mark",
-            ));
-        }
-
+        Writer::validate_binary_mark(binary_mark)?;
+        file.write_all(b"%")?;
+        file.write_all(binary_mark)?;
+        file.write_all(b"\n")?;
         Ok(())
     }
 }

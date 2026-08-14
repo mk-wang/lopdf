@@ -53,6 +53,12 @@
 let report = document.optimize(&lopdf::OptimizeOptions::maximum_compression())?;
 ```
 
+图片模式（MuPDF 风格：高于 180 DPI 时降到 120 DPI，JPEG 质量 65；仅结果更小时替换）：
+
+```rust
+let report = document.optimize(&lopdf::OptimizeOptions::image())?;
+```
+
 Feature：
 
 - `embed_image`：图片解码、重采样和 JPEG/Flate 重编码
@@ -79,7 +85,7 @@ Feature：
 | content clean | 页面、Form、Pattern、soft mask、annotation AP、Type3；最小空白 | 页面、所有 Form、tiling Pattern、Type3；严格解析、64 MiB 上限、Inline Image 跳过 | 本次补齐 Type3 与最短 string |
 | content sanitize | 平衡 q/Q、删除重复 graphics-state/color 操作、重建已用 Resources | 未实现 | 高价值但语义面大；需独立 graphics-state processor |
 | font subset | simple/CID TrueType、CFF/OpenType、非 Identity CMap；同字体程序先去重 | Type0 + Identity-H/V + CIDFontType2 + FontFile2 | 继续保守；下一优先级为 simple TrueType |
-| image rewrite | JPEG/JPX/Flate/Fax；灰/彩/二值；可色彩转换；Inline Image | JPEG/Flate/LZW/ASCII；灰/彩/二值；共享 DPI/嵌套 Form；mask/JPX/CMYK/Inline 跳过 | 已覆盖常见安全子集 |
+| image rewrite | JPEG/JPX/Flate/Fax；灰/彩/二值；可色彩转换；Inline Image | JPEG/Flate/LZW/ASCII；灰/彩/二值；DeviceCMYK 与 4 通道 ICCBased；共享 DPI/嵌套 Form；mask/JPX/Inline 跳过 | 已覆盖常见安全子集 |
 | page select/vectorize/appearance/encryption | 工具级附加能力 | 非优化器职责或已有独立 API | 不纳入压缩优化器 |
 
 优先级结论：
@@ -87,16 +93,15 @@ Feature：
 1. 已实现：XRef stream、最短字符串表示、Type3 CharProcs。
 2. 下一安全增益：simple TrueType 子集化、font-program digest 去重。
 3. 需要更强验证后再做：graphics-state sanitize、非 Identity CMap/CFF、Inline Image。
-4. 不为追求尺寸强制做：CMYK/DeviceN 色彩转换、mask 重写、JPX/JBIG2/CCITT 编码。
+4. 不为追求尺寸强制做：DeviceN/Separation 色彩转换、mask 重写、JPX/JBIG2/CCITT 编码。
 
 ## 图片处理范围
 
 已支持安全重写：
 
 - JPEG、Flate、LZW、ASCII85、ASCIIHex、RunLength 图片流
-- DeviceGray、DeviceRGB、CalGray、CalRGB
-- 1 通道或 3 通道 ICCBased 色彩空间
-- 1 bit 与 8 bit 图片
+- DeviceGray、DeviceRGB、DeviceCMYK、CalGray、CalRGB
+- 1 通道、3 通道或 4 通道 ICCBased 色彩空间
 - 嵌套 Form、继承 Resources、CTM、UserUnit、Pattern、soft mask 中的图片使用分析
 - 同一 Image XObject 多处复用时，按最低实际 DPI 决定是否降采样
 - 仅在结果更小时替换图片流
@@ -104,8 +109,7 @@ Feature：
 当前保守跳过：
 
 - JPX/JPEG 2000
-- CMYK、DeviceN、Separation 和不支持的 ICC 色彩空间
-- Inline Image
+- DeviceN、Separation 和不支持的 ICC 色彩空间
 - 带 `Mask`/`SMask` 的 base image 及其 mask image
 - 不支持的 filter、位深、尺寸或解码失败的图片
 

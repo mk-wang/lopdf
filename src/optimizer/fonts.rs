@@ -221,13 +221,32 @@ impl Document {
             let cid_set = self.add_object(cid_set_stream(&subset_glyphs));
             let mut updated_descendants = HashSet::new();
             let mut updated_descriptors = HashSet::new();
+            let subset_tag = subset_tag(font_file_id, &subset_glyphs);
             for (candidate, _) in &candidates {
-                if kind == FontProgramKind::TrueType && updated_descendants.insert(candidate.descendant_id) {
-                    self.get_dictionary_mut(candidate.descendant_id)?
-                        .set("CIDToGIDMap", cid_to_gid.expect("TrueType CIDToGIDMap"));
+                if let Ok(dictionary) = self.get_dictionary(candidate.font_id)
+                    && let Ok(base_font) = dictionary.get(b"BaseFont").and_then(Object::as_name)
+                {
+                    let name = subset_name(base_font, &subset_tag);
+                    self.get_dictionary_mut(candidate.font_id)?
+                        .set("BaseFont", Object::Name(name));
+                }
+                if updated_descendants.insert(candidate.descendant_id) {
+                    let descendant = self.get_dictionary_mut(candidate.descendant_id)?;
+                    if kind == FontProgramKind::TrueType {
+                        descendant.set("CIDToGIDMap", cid_to_gid.expect("TrueType CIDToGIDMap"));
+                    }
+                    if let Ok(base_font) = descendant.get(b"BaseFont").and_then(Object::as_name) {
+                        let name = subset_name(base_font, &subset_tag);
+                        descendant.set("BaseFont", Object::Name(name));
+                    }
                 }
                 if updated_descriptors.insert(candidate.descriptor_id) {
-                    self.get_dictionary_mut(candidate.descriptor_id)?.set("CIDSet", cid_set);
+                    let descriptor = self.get_dictionary_mut(candidate.descriptor_id)?;
+                    descriptor.set("CIDSet", cid_set);
+                    if let Ok(font_name) = descriptor.get(b"FontName").and_then(Object::as_name) {
+                        let name = subset_name(font_name, &subset_tag);
+                        descriptor.set("FontName", Object::Name(name));
+                    }
                 }
             }
             self.objects.insert(font_file_id, Object::Stream(subset_stream));
@@ -260,7 +279,7 @@ fn analyze_font_usage(document: &Document, max_content_bytes: usize) -> FontUsag
                 continue;
             }
         };
-        let content = match Content::decode(&bytes) {
+        let content = match Content::decode_strict(&bytes) {
             Ok(content) => content,
             Err(_) => {
                 analysis.skipped_content_streams += 1;
@@ -395,7 +414,7 @@ fn analyze_resource_stream(
         .unwrap_or(parent_resources);
     match stream
         .decompressed_content_with_limit(max_content_bytes)
-        .and_then(|bytes| Content::decode(&bytes))
+        .and_then(|bytes| Content::decode_strict(&bytes))
     {
         Ok(content) => analyze_content(
             document,
@@ -584,6 +603,30 @@ fn protect_interactive_form_fonts(document: &Document, analysis: &mut FontUsageA
             analysis.interactive_fonts.insert(id);
         }
     }
+}
+
+fn subset_tag(font_file_id: ObjectId, glyphs: &BTreeSet<u16>) -> Vec<u8> {
+    let mut hasher = Sha256::new();
+    hasher.update(font_file_id.0.to_be_bytes());
+    hasher.update(font_file_id.1.to_be_bytes());
+    for glyph in glyphs {
+        hasher.update(glyph.to_be_bytes());
+    }
+    let digest = hasher.finalize();
+    digest[..6].iter().map(|byte| b'A' + byte % 26).collect()
+}
+
+fn subset_name(original: &[u8], tag: &[u8]) -> Vec<u8> {
+    let base = if original.len() > 7 && original[6] == b'+' && original[..6].iter().all(u8::is_ascii_uppercase) {
+        &original[7..]
+    } else {
+        original
+    };
+    let mut name = Vec::with_capacity(tag.len() + 1 + base.len());
+    name.extend_from_slice(tag);
+    name.push(b'+');
+    name.extend_from_slice(base);
+    name
 }
 
 fn font_candidate(document: &Document, font_id: ObjectId) -> std::result::Result<FontCandidate, FontSkipReason> {

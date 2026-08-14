@@ -340,24 +340,41 @@ pub(crate) fn dict_dup(input: ParserInput) -> NomResult<Dictionary> {
 
 fn stream<'a>(input: ParserInput<'a>, reader: &Reader, already_seen: &mut HashSet<ObjectId>) -> NomResult<'a, Object> {
     let (i, dict) = terminated(dictionary, (space, tag(&b"stream"[..]), space0, eol)).parse(input)?;
+    let declared_length = dict
+        .get(b"Length")
+        .and_then(|value| {
+            if let Ok(id) = value.as_reference() {
+                reader.get_object(id, already_seen).and_then(|value| value.as_i64())
+            } else {
+                value.as_i64()
+            }
+        })
+        .ok();
 
-    if let Ok(length) = dict.get(b"Length").and_then(|value| {
-        if let Ok(id) = value.as_reference() {
-            reader.get_object(id, already_seen).and_then(|value| value.as_i64())
-        } else {
-            value.as_i64()
-        }
-    }) {
-        if length < 0 {
-            // artificial error kind is created to allow descriptive nom errors
-            return Err(nom::Err::Failure(NomError::from_error_kind(i, ErrorKind::LengthValue)));
-        }
-        let (i, data) = terminated(take(length as usize), pair(opt(eol), tag(&b"endstream"[..]))).parse(i)?;
-        Ok((i, Object::Stream(Stream::new(dict, data.to_vec()))))
-    } else {
-        // Return position relative to the start of the stream dictionary.
-        Ok((i, Object::Stream(Stream::with_position(dict, input.len() - i.len()))))
+    if let Some(length) = declared_length
+        && let Ok(end) = crate::stream_bounds::checked_stream_end(0, length, i.len())
+        && let Some(after) = crate::stream_bounds::declared_endstream(i, end)
+    {
+        return Ok((&i[after..], Object::Stream(Stream::new(dict, i[..end].to_vec()))));
     }
+
+    if reader.strict {
+        // Strict mode never guesses a stream boundary: a missing, invalid, or
+        // mismatched /Length is a malformed indirect object.
+        return Err(nom::Err::Failure(NomError::from_error_kind(i, ErrorKind::LengthValue)));
+    }
+
+    // A damaged /Length must not make the remainder of the document part of
+    // the stream. Recover only a line-delimited endstream marker; the normal
+    // exact-length path above remains authoritative for conforming files.
+    if let Some((end, after)) = crate::stream_bounds::recovered_stream_end(i) {
+        return Ok((&i[after..], Object::Stream(Stream::new(dict, i[..end].to_vec()))));
+    }
+
+    // Keep the deferred form for callers that can report a precise invalid
+    // stream error after object loading rather than silently serializing an
+    // empty stream.
+    Ok((i, Object::Stream(Stream::with_position(dict, input.len() - i.len()))))
 }
 
 fn unsigned_int<I: FromStr>(input: ParserInput) -> NomResult<I> {
@@ -421,17 +438,32 @@ pub fn indirect_object(
     input: ParserInput, offset: usize, expected_id: Option<ObjectId>, reader: &Reader,
     already_seen: &mut HashSet<ObjectId>,
 ) -> crate::Result<(ObjectId, Object)> {
-    let (id, mut object) = _indirect_object(input.take_from(offset), offset, expected_id, reader, already_seen)?;
+    let (id, object, _) = indirect_object_with_remainder(input, offset, expected_id, reader, already_seen)?;
+
+    Ok((id, object))
+}
+
+/// Parse an indirect object and return the absolute offset immediately after
+/// the parsed object. Repair scanning uses the remainder to advance over
+/// stream bodies instead of searching raw bytes for `obj`/`trailer` tokens.
+pub(crate) fn indirect_object_with_remainder(
+    input: ParserInput, offset: usize, expected_id: Option<ObjectId>, reader: &Reader,
+    already_seen: &mut HashSet<ObjectId>,
+) -> crate::Result<(ObjectId, Object, usize)> {
+    let object_input = input.take_from(offset);
+    let (id, mut object, rest) = _indirect_object(object_input, offset, expected_id, reader, already_seen)?;
 
     offset_stream(&mut object, offset);
 
-    Ok((id, object))
+    let consumed = object_input.len() - rest.len();
+    let end = offset.checked_add(consumed).ok_or(Error::InvalidOffset(offset))?;
+    Ok((id, object, end))
 }
 
 fn _indirect_object<'a>(
     input: ParserInput<'a>, offset: usize, expected_id: Option<ObjectId>, reader: &Reader,
     already_seen: &mut HashSet<ObjectId>,
-) -> crate::Result<(ObjectId, Object)> {
+) -> crate::Result<(ObjectId, Object, ParserInput<'a>)> {
     let (i, (_, object_id)) = terminated((space, object_id), pair(tag(&b"obj"[..]), space))
         .parse(input)
         .map_err(|_| Error::IndirectObject { offset })?;
@@ -442,7 +474,7 @@ fn _indirect_object<'a>(
     }
 
     let object_offset = input.len() - i.len();
-    let (_, mut object) = terminated(
+    let (rest, mut object) = terminated(
         |i: ParserInput<'a>| object(i, reader, already_seen),
         (space, opt(tag(&b"endobj"[..])), space),
     )
@@ -451,7 +483,7 @@ fn _indirect_object<'a>(
 
     offset_stream(&mut object, object_offset);
 
-    Ok((object_id, object))
+    Ok((object_id, object, rest))
 }
 
 pub fn header(input: ParserInput, strict: bool) -> Option<String> {
@@ -494,15 +526,43 @@ pub fn binary_mark(input: ParserInput) -> Option<Vec<u8>> {
 
 /// Decode CrossReferenceTable
 fn xref(input: ParserInput) -> NomResult<Xref> {
-    let xref_eol = map(alt((tag(&b" \r"[..]), tag(&b" \n"[..]), tag(&b"\r\n"[..]))), |_| ());
-    let xref_entry = pair(
-        separated_pair(unsigned_int, tag(&b" "[..]), unsigned_int::<u32>),
-        delimited(tag(&b" "[..]), map(one_of("nf"), |k| k == 'n'), xref_eol),
+    let xref_eol = map(
+        alt((
+            tag(&b" \r"[..]),
+            tag(&b" \n"[..]),
+            tag(&b"\r\n"[..]),
+            tag(&b"\n"[..]),
+            tag(&b"\r"[..]),
+        )),
+        |_| (),
+    );
+    let xref_entry = map_res(
+        pair(
+            separated_pair(unsigned_int::<u64>, tag(&b" "[..]), unsigned_int::<u64>),
+            delimited(tag(&b" "[..]), map(one_of("nf"), |k| k == 'n'), xref_eol),
+        ),
+        |((offset, generation), is_normal)| -> Result<Option<XrefEntry>, ()> {
+            if !is_normal {
+                return Ok(None);
+            }
+            Ok(Some(XrefEntry::Normal {
+                offset: u32::try_from(offset).map_err(|_| ())?,
+                generation: u16::try_from(generation).map_err(|_| ())?,
+            }))
+        },
     );
 
-    let xref_section = pair(
-        separated_pair(unsigned_int::<usize>, tag(&b" "[..]), unsigned_int::<u32>),
-        preceded(pair(opt(tag(&b" "[..])), eol), many0(xref_entry)),
+    let xref_section = map_res(
+        pair(
+            separated_pair(unsigned_int::<u64>, tag(&b" "[..]), unsigned_int::<u64>),
+            preceded(pair(opt(tag(&b" "[..])), eol), many0(xref_entry)),
+        ),
+        |((start, _count), entries)| -> Result<(u32, Vec<Option<XrefEntry>>), ()> {
+            let start = u32::try_from(start).map_err(|_| ())?;
+            let entry_count = u32::try_from(entries.len()).map_err(|_| ())?;
+            start.checked_add(entry_count).ok_or(())?;
+            Ok((start, entries))
+        },
     );
 
     delimited(
@@ -510,11 +570,12 @@ fn xref(input: ParserInput) -> NomResult<Xref> {
         fold_many1(
             xref_section,
             || -> Xref { Xref::new(0, XrefType::CrossReferenceTable) },
-            |mut xref, ((start, _count), entries)| {
-                for (index, ((offset, generation), is_normal)) in entries.into_iter().enumerate() {
-                    if is_normal && let Ok(generation) = generation.try_into() {
-                        xref.insert((start + index) as u32, XrefEntry::Normal { offset, generation });
-                    }
+            |mut xref, (start, entries)| {
+                for (index, entry) in (0_u32..)
+                    .zip(entries)
+                    .filter_map(|(index, entry)| entry.map(|entry| (index, entry)))
+                {
+                    xref.insert(start + index, entry);
                 }
                 xref
             },
@@ -533,14 +594,15 @@ pub fn xref_and_trailer(input: ParserInput, reader: &Reader) -> crate::Result<(X
         xref.size = trailer
             .get(b"Size")
             .and_then(Object::as_i64)
-            .map_err(|_| error::ParseError::InvalidTrailer)? as u32;
+            .map_err(|_| error::ParseError::InvalidTrailer)
+            .and_then(|size| u32::try_from(size).map_err(|_| error::ParseError::InvalidTrailer))?;
         Ok((xref, trailer))
     });
     alt((
         xref_trailer,
         (|input| {
             _indirect_object(input, 0, None, reader, &mut HashSet::new())
-                .map(|(_, obj)| {
+                .map(|(_, obj, _)| {
                     let res = match obj {
                         Object::Stream(stream) => decode_xref_stream_with_limit(stream, reader.max_decompressed_size),
                         _ => Err(crate::error::ParseError::InvalidXref.into()),

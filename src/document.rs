@@ -216,36 +216,40 @@ impl Document {
         }
     }
 
-    /// Traverse objects from trailer recursively, return all referenced object IDs.
     pub fn traverse_objects<A: Fn(&mut Object)>(&mut self, action: A) -> Vec<ObjectId> {
-        fn traverse_array<A: Fn(&mut Object)>(array: &mut [Object], action: &A, refs: &mut Vec<ObjectId>) {
+        fn traverse_array<A: Fn(&mut Object)>(
+            array: &mut [Object], action: &A, refs: &mut Vec<ObjectId>, seen: &mut HashSet<ObjectId>,
+        ) {
             for item in array.iter_mut() {
-                traverse_object(item, action, refs);
+                traverse_object(item, action, refs, seen);
             }
         }
-        fn traverse_dictionary<A: Fn(&mut Object)>(dict: &mut Dictionary, action: &A, refs: &mut Vec<ObjectId>) {
-            for (_, v) in dict.iter_mut() {
-                traverse_object(v, action, refs);
+        fn traverse_dictionary<A: Fn(&mut Object)>(
+            dict: &mut Dictionary, action: &A, refs: &mut Vec<ObjectId>, seen: &mut HashSet<ObjectId>,
+        ) {
+            for (_, value) in dict.iter_mut() {
+                traverse_object(value, action, refs, seen);
             }
         }
-        fn traverse_object<A: Fn(&mut Object)>(object: &mut Object, action: &A, refs: &mut Vec<ObjectId>) {
+        fn traverse_object<A: Fn(&mut Object)>(
+            object: &mut Object, action: &A, refs: &mut Vec<ObjectId>, seen: &mut HashSet<ObjectId>,
+        ) {
             action(object);
             match object {
-                Object::Array(array) => traverse_array(array, action, refs),
-                Object::Dictionary(dict) => traverse_dictionary(dict, action, refs),
-                Object::Stream(stream) => traverse_dictionary(&mut stream.dict, action, refs),
-                Object::Reference(id) if !refs.contains(id) => {
-                    refs.push(*id);
-                }
+                Object::Array(array) => traverse_array(array, action, refs, seen),
+                Object::Dictionary(dict) => traverse_dictionary(dict, action, refs, seen),
+                Object::Stream(stream) => traverse_dictionary(&mut stream.dict, action, refs, seen),
+                Object::Reference(id) if seen.insert(*id) => refs.push(*id),
                 _ => {}
             }
         }
         let mut refs = vec![];
-        traverse_dictionary(&mut self.trailer, &action, &mut refs);
+        let mut seen = HashSet::new();
+        traverse_dictionary(&mut self.trailer, &action, &mut refs, &mut seen);
         let mut index = 0;
         while index < refs.len() {
             if let Some(object) = self.objects.get_mut(&refs[index]) {
-                traverse_object(object, &action, &mut refs);
+                traverse_object(object, &action, &mut refs, &mut seen);
             }
             index += 1;
         }

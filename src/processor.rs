@@ -1,6 +1,6 @@
 use crate::Result;
 use crate::{Document, Object, ObjectId};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
 use std::io::Write;
 
@@ -65,7 +65,7 @@ impl Document {
     /// Prune all unused objects.
     pub fn prune_objects(&mut self) -> Vec<ObjectId> {
         let mut ids = vec![];
-        let refs = self.traverse_objects(|_| {});
+        let refs: HashSet<_> = self.traverse_objects(|_| {}).into_iter().collect();
         for id in self.objects.keys() {
             if !refs.contains(id) {
                 ids.push(*id);

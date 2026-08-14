@@ -220,6 +220,28 @@ fn subsets_name_keyed_cff_without_rewriting_character_codes() {
             .and_then(Object::as_reference)
             .is_ok()
     );
+    let type0_name = document
+        .get_dictionary(font_id)
+        .unwrap()
+        .get(b"BaseFont")
+        .and_then(Object::as_name)
+        .unwrap();
+    let descendant_name = document
+        .get_dictionary(descendant_id)
+        .unwrap()
+        .get(b"BaseFont")
+        .and_then(Object::as_name)
+        .unwrap();
+    let descriptor_name = document
+        .get_dictionary(descriptor_id)
+        .unwrap()
+        .get(b"FontName")
+        .and_then(Object::as_name)
+        .unwrap();
+    assert!(type0_name.len() > 7 && type0_name[6] == b'+');
+    assert_eq!(type0_name, descendant_name);
+    assert_eq!(type0_name, descriptor_name);
+    assert!(type0_name[..6].iter().all(u8::is_ascii_uppercase));
     let optimized_content = document.get_page_content(page_id);
     let operations = Content::decode_strict(&optimized_content).unwrap().operations;
     assert_eq!(operations[2].operands[0].as_str().unwrap(), b"\0\x03");

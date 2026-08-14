@@ -18,6 +18,19 @@ pub struct OptimizeOptions {
 }
 
 impl OptimizeOptions {
+    /// MuPDF-style image optimization: lossy color and grayscale images above
+    /// 180 DPI are bicubic-resampled to 120 DPI and JPEG-encoded at quality 65.
+    pub fn image() -> Self {
+        Self {
+            // This profile is intentionally image-only.  In particular, do not
+            // let the availability of the font-subsetting feature make an
+            // image optimization call mutate embedded fonts as a side effect.
+            fonts: None,
+            images: Some(ImageOptimizationOptions::image()),
+            ..Self::default()
+        }
+    }
+
     pub fn maximum_compression() -> Self {
         Self {
             fonts: {
@@ -98,6 +111,14 @@ impl ImageClassOptions {
             recompression: ImageRecompression::Jpeg { quality: 70 },
         }
     }
+
+    fn mupdf_lossy_jpeg() -> Self {
+        Self {
+            subsample_above_dpi: Some(180.0),
+            subsample_to_dpi: 120.0,
+            recompression: ImageRecompression::Jpeg { quality: 65 },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -123,6 +144,33 @@ pub struct ImageOptimizationOptions {
 }
 
 impl ImageOptimizationOptions {
+    /// Image settings matching the MuPDF image rewrite profile.
+    pub fn image() -> Self {
+        Self {
+            bitonal: ImageClassOptions {
+                subsample_above_dpi: None,
+                subsample_to_dpi: 120.0,
+                recompression: ImageRecompression::Never,
+            },
+            grayscale_lossy: ImageClassOptions::mupdf_lossy_jpeg(),
+            grayscale_lossless: ImageClassOptions {
+                subsample_above_dpi: None,
+                subsample_to_dpi: 120.0,
+                recompression: ImageRecompression::Never,
+            },
+            color_lossy: ImageClassOptions::mupdf_lossy_jpeg(),
+            color_lossless: ImageClassOptions {
+                subsample_above_dpi: None,
+                subsample_to_dpi: 120.0,
+                recompression: ImageRecompression::Never,
+            },
+            resize_filter: ImageResizeFilter::CatmullRom,
+            recompress_only_if_smaller: true,
+            max_decoded_image_bytes: 512 * 1024 * 1024,
+            max_decoded_content_bytes: 64 * 1024 * 1024,
+        }
+    }
+
     pub fn maximum_compression() -> Self {
         Self {
             bitonal: ImageClassOptions {
@@ -267,6 +315,23 @@ impl Document {
         if self.is_encrypted() {
             return Err(Error::InvalidStream(
                 "cannot optimize a PDF that is still encrypted; load it with a valid password first".to_string(),
+            ));
+        }
+
+        // Check optional feature requirements before any optimizer stage can
+        // mutate the document. This keeps a profile that mixes unavailable
+        // stages from applying a partial transformation and then returning an
+        // `Unimplemented` error.
+        #[cfg(not(feature = "font_subsetting"))]
+        if options.fonts.is_some() {
+            return Err(Error::Unimplemented(
+                "font optimization requires the `font_subsetting` feature",
+            ));
+        }
+        #[cfg(not(feature = "embed_image"))]
+        if options.images.is_some() {
+            return Err(Error::Unimplemented(
+                "image optimization requires the `embed_image` feature",
             ));
         }
 
@@ -416,13 +481,16 @@ impl Document {
                 break;
             }
 
-            self.traverse_objects(|object| {
-                if let Object::Reference(id) = object
-                    && let Some(replacement) = replacements.get(id)
-                {
-                    *id = *replacement;
-                }
-            });
+            for (_, value) in self.trailer.iter_mut() {
+                rewrite_references(value, &replacements);
+            }
+            // Deduplication considers every object, including objects that are
+            // intentionally kept unreachable when pruning is disabled. Update
+            // those graphs too, otherwise removing a duplicate leaves a
+            // dangling reference in the serialized document.
+            for object in self.objects.values_mut() {
+                rewrite_references(object, &replacements);
+            }
             for id in replacements.keys() {
                 self.objects.remove(id);
             }
@@ -431,6 +499,33 @@ impl Document {
         removed
     }
 }
+
+fn rewrite_references(object: &mut Object, replacements: &BTreeMap<ObjectId, ObjectId>) {
+    match object {
+        Object::Reference(id) => {
+            if let Some(replacement) = replacements.get(id) {
+                *id = *replacement;
+            }
+        }
+        Object::Array(values) => {
+            for value in values {
+                rewrite_references(value, replacements);
+            }
+        }
+        Object::Dictionary(dictionary) => {
+            for (_, value) in dictionary.iter_mut() {
+                rewrite_references(value, replacements);
+            }
+        }
+        Object::Stream(stream) => {
+            for (_, value) in stream.dict.iter_mut() {
+                rewrite_references(value, replacements);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn collect_type3_charproc_stream_ids(
     document: &Document, object: &Object, depth: usize, content_ids: &mut HashSet<ObjectId>,
 ) {
@@ -603,12 +698,16 @@ mod images {
     use super::*;
     use crate::content::Content;
     use image::imageops::FilterType;
-    use image::{GrayImage, ImageFormat, RgbImage};
+    use image::{GrayImage, RgbImage, RgbaImage};
+    use jpeg_decoder::{Decoder as JpegDecoder, PixelFormat};
     use jpeg_encoder::{ColorType as JpegColorType, Encoder as JpegEncoder, SamplingFactor};
+    use std::borrow::Cow;
+    use std::io::Cursor;
 
     #[derive(Debug, Clone, Copy, Default)]
     struct ImageUsage {
         minimum_dpi: Option<f32>,
+        no_resize: bool,
     }
 
     impl ImageUsage {
@@ -617,6 +716,10 @@ mod images {
                 return;
             }
             self.minimum_dpi = Some(self.minimum_dpi.map_or(dpi, |current| current.min(dpi)));
+        }
+
+        fn protect_resize(&mut self) {
+            self.no_resize = true;
         }
     }
 
@@ -674,6 +777,7 @@ mod images {
         images: BTreeMap<ObjectId, ImageUsage>,
         inline_images: usize,
         skipped_content_streams: usize,
+        conservative: bool,
     }
 
     impl Document {
@@ -715,7 +819,11 @@ mod images {
                     continue;
                 }
                 let usage = analysis.images.get(&id).copied().unwrap_or_default();
-                match rewrite_image(self, original, usage, options) {
+                // A failed usage walk cannot prove that the image is never
+                // displayed at a larger size. Recompression remains safe,
+                // but resizing must fail closed for the whole document.
+                let allow_resize = analysis.skipped_content_streams == 0;
+                match rewrite_image(self, original, usage, options, allow_resize) {
                     Ok(rewrite) => {
                         let old_len = original.content.len();
                         let new_len = rewrite.stream.content.len();
@@ -772,32 +880,191 @@ mod images {
             images: BTreeMap::new(),
             inline_images: 0,
             skipped_content_streams: 0,
+            conservative: false,
         };
         for page_id in document.get_pages().into_values() {
-            let Ok(Some(resources)) = inherited_resources(document, page_id) else {
-                continue;
+            let resources = match inherited_resources(document, page_id) {
+                Ok(Some(resources)) => resources,
+                Ok(None) => Dictionary::new(),
+                Err(_) => {
+                    analysis.skipped_content_streams += 1;
+                    Dictionary::new()
+                }
             };
             let user_unit = inherited_number(document, page_id, b"UserUnit").unwrap_or(1.0);
-            let Ok(bytes) = document.get_page_content_with_limit(page_id, max_content_bytes) else {
+            match document.get_page_content_with_limit(page_id, max_content_bytes) {
+                Ok(bytes) => match Content::decode_strict(&bytes) {
+                    Ok(content) => analyze_content(
+                        document,
+                        &content,
+                        &resources,
+                        Matrix::scale(user_unit),
+                        max_content_bytes,
+                        0,
+                        &mut HashSet::new(),
+                        &mut analysis,
+                    ),
+                    Err(_) => analysis.skipped_content_streams += 1,
+                },
+                Err(_) => analysis.skipped_content_streams += 1,
+            }
+
+            // Annotation and widget appearance streams are rendered outside
+            // the page content stream. Their Rect/BBox transform is not
+            // available in the content walker, so treat any image found there
+            // as resize-protected rather than risking an undersized rewrite.
+            analysis.conservative = true;
+            analyze_page_appearances(document, page_id, &resources, max_content_bytes, &mut analysis);
+            analysis.conservative = false;
+        }
+        // Type3 glyph procedures are another independent rendering entry
+        // point. Their FontMatrix and glyph placement are not represented in
+        // the page CTM walker, so protect images discovered in every CharProc
+        // from DPI-based resizing as well.
+        analysis.conservative = true;
+        analyze_type3_charprocs(document, max_content_bytes, &mut analysis);
+        analysis.conservative = false;
+        analysis
+    }
+
+    fn analyze_type3_charprocs(document: &Document, max_content_bytes: usize, analysis: &mut UsageAnalysis) {
+        for object in document.objects.values() {
+            let Some(font) = (match object {
+                Object::Dictionary(dictionary) => Some(dictionary),
+                Object::Stream(stream) => Some(&stream.dict),
+                _ => None,
+            }) else {
+                continue;
+            };
+            if font.get(b"Subtype").and_then(Object::as_name).ok() != Some(b"Type3") {
+                continue;
+            }
+            let resources = dictionary_value(document, font, b"Resources")
+                .and_then(|value| value.as_dict().ok())
+                .cloned()
+                .unwrap_or_default();
+            let Some(charprocs) = dictionary_value(document, font, b"CharProcs").and_then(|value| value.as_dict().ok())
+            else {
                 analysis.skipped_content_streams += 1;
                 continue;
             };
-            let Ok(content) = Content::decode(&bytes) else {
+            for (_, value) in charprocs {
+                let Some((id, stream)) = object_stream(document, Some(value)) else {
+                    analysis.skipped_content_streams += 1;
+                    continue;
+                };
+                let mut active_forms = HashSet::new();
+                analyze_resource_stream(
+                    document,
+                    id,
+                    &stream,
+                    &resources,
+                    Matrix::IDENTITY,
+                    max_content_bytes,
+                    0,
+                    &mut active_forms,
+                    analysis,
+                );
+            }
+        }
+    }
+
+    fn analyze_page_appearances(
+        document: &Document, page_id: ObjectId, page_resources: &Dictionary, max_content_bytes: usize,
+        analysis: &mut UsageAnalysis,
+    ) {
+        let Ok(page) = document.get_dictionary(page_id) else {
+            return;
+        };
+        let Some(annotations) = dictionary_value(document, page, b"Annots").and_then(|value| value.as_array().ok())
+        else {
+            return;
+        };
+        let mut visited = HashSet::new();
+        for annotation in annotations {
+            let Some((_, annotation)) = document.dereference(annotation).ok() else {
                 analysis.skipped_content_streams += 1;
                 continue;
             };
-            analyze_content(
+            let Ok(appearance) = annotation.as_dict().and_then(|dictionary| dictionary.get(b"AP")) else {
+                continue;
+            };
+            analyze_appearance_object(
                 document,
-                &content,
-                &resources,
-                Matrix::scale(user_unit),
+                appearance,
+                page_resources,
                 max_content_bytes,
                 0,
-                &mut HashSet::new(),
-                &mut analysis,
+                &mut visited,
+                analysis,
             );
         }
-        analysis
+    }
+
+    fn analyze_appearance_object(
+        document: &Document, value: &Object, parent_resources: &Dictionary, max_content_bytes: usize, depth: usize,
+        visited: &mut HashSet<ObjectId>, analysis: &mut UsageAnalysis,
+    ) {
+        if depth >= MAX_OPTIMIZER_DEPTH {
+            analysis.skipped_content_streams += 1;
+            return;
+        }
+        let Ok((id, value)) = document.dereference(value) else {
+            analysis.skipped_content_streams += 1;
+            return;
+        };
+        match value {
+            Object::Stream(stream) => {
+                if stream.dict.get(b"Subtype").and_then(Object::as_name).ok() == Some(b"Image") {
+                    if let Some(id) = id {
+                        analysis.images.entry(id).or_default().protect_resize();
+                    }
+                } else {
+                    let mut active_forms = HashSet::new();
+                    analyze_resource_stream(
+                        document,
+                        id,
+                        stream,
+                        parent_resources,
+                        Matrix::IDENTITY,
+                        max_content_bytes,
+                        depth,
+                        &mut active_forms,
+                        analysis,
+                    );
+                }
+            }
+            Object::Dictionary(dictionary) => {
+                if id.is_some_and(|id| !visited.insert(id)) {
+                    return;
+                }
+                for (_, child) in dictionary {
+                    analyze_appearance_object(
+                        document,
+                        child,
+                        parent_resources,
+                        max_content_bytes,
+                        depth + 1,
+                        visited,
+                        analysis,
+                    );
+                }
+            }
+            Object::Array(values) => {
+                for child in values {
+                    analyze_appearance_object(
+                        document,
+                        child,
+                        parent_resources,
+                        max_content_bytes,
+                        depth + 1,
+                        visited,
+                        analysis,
+                    );
+                }
+            }
+            _ => {}
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -838,9 +1105,14 @@ mod images {
                                     positive_dimension(&stream.dict, b"Width"),
                                     positive_dimension(&stream.dict, b"Height"),
                                 )
-                                && let Some(dpi) = ctm.dpi(width, height)
                             {
-                                analysis.images.entry(id).or_default().record(dpi);
+                                let conservative = analysis.conservative;
+                                let usage = analysis.images.entry(id).or_default();
+                                if conservative {
+                                    usage.protect_resize();
+                                } else if let Some(dpi) = ctm.dpi(width, height) {
+                                    usage.record(dpi);
+                                }
                             }
                         }
                         Some(b"Form") => analyze_resource_stream(
@@ -916,7 +1188,7 @@ mod images {
             .unwrap_or_else(|| parent_resources.clone());
         match stream
             .decompressed_content_with_limit(max_content_bytes)
-            .and_then(|bytes| Content::decode(&bytes))
+            .and_then(|bytes| Content::decode_strict(&bytes))
         {
             Ok(content) => analyze_content(
                 document,
@@ -1057,6 +1329,7 @@ mod images {
     enum ColorModel {
         Gray,
         Rgb,
+        Cmyk,
     }
 
     #[derive(Debug)]
@@ -1064,6 +1337,7 @@ mod images {
         Bitonal(GrayImage),
         Gray(GrayImage),
         Rgb(RgbImage),
+        Cmyk(RgbaImage),
     }
 
     impl Pixels {
@@ -1071,6 +1345,7 @@ mod images {
             match self {
                 Self::Bitonal(image) | Self::Gray(image) => image.dimensions(),
                 Self::Rgb(image) => image.dimensions(),
+                Self::Cmyk(image) => image.dimensions(),
             }
         }
 
@@ -1082,6 +1357,7 @@ mod images {
                 }
                 Self::Gray(image) => Self::Gray(image::imageops::resize(&image, width, height, filter)),
                 Self::Rgb(image) => Self::Rgb(image::imageops::resize(&image, width, height, filter)),
+                Self::Cmyk(image) => Self::Cmyk(image::imageops::resize(&image, width, height, filter)),
             }
         }
     }
@@ -1094,6 +1370,7 @@ mod images {
 
     fn rewrite_image(
         document: &Document, original: &Stream, usage: ImageUsage, options: &ImageOptimizationOptions,
+        allow_resize: bool,
     ) -> std::result::Result<ImageRewrite, ImageSkipReason> {
         if original.dict.has(b"SMask") || original.dict.has(b"Mask") {
             return Err(ImageSkipReason::Masked);
@@ -1122,6 +1399,7 @@ mod images {
         let channels = match model {
             ColorModel::Gray => 1,
             ColorModel::Rgb => 3,
+            ColorModel::Cmyk => 4,
         };
         let decoded_size = usize::try_from(width)
             .ok()
@@ -1141,19 +1419,22 @@ mod images {
         if pixels.dimensions() != (width, height) {
             return Err(ImageSkipReason::InvalidDimensions);
         }
+        apply_decode(&original.dict, &mut pixels)?;
         let class_options = match (&pixels, lossy) {
             (Pixels::Bitonal(_), _) => options.bitonal,
             (Pixels::Gray(_), true) => options.grayscale_lossy,
             (Pixels::Gray(_), false) => options.grayscale_lossless,
-            (Pixels::Rgb(_), true) => options.color_lossy,
-            (Pixels::Rgb(_), false) => options.color_lossless,
+            (Pixels::Rgb(_), true) | (Pixels::Cmyk(_), true) => options.color_lossy,
+            (Pixels::Rgb(_), false) | (Pixels::Cmyk(_), false) => options.color_lossless,
         };
         if class_options.recompression == ImageRecompression::Never {
             return Err(ImageSkipReason::PolicyDisabled);
         }
 
         let mut resized = false;
-        if let (Some(current_dpi), Some(threshold)) = (usage.minimum_dpi, class_options.subsample_above_dpi)
+        if allow_resize
+            && !usage.no_resize
+            && let (Some(current_dpi), Some(threshold)) = (usage.minimum_dpi, class_options.subsample_above_dpi)
             && current_dpi > threshold
             && class_options.subsample_to_dpi > 0.0
         {
@@ -1188,6 +1469,7 @@ mod images {
         match value {
             Object::Name(name) if matches!(name.as_slice(), b"DeviceGray" | b"G" | b"CalGray") => Ok(ColorModel::Gray),
             Object::Name(name) if matches!(name.as_slice(), b"DeviceRGB" | b"RGB" | b"CalRGB") => Ok(ColorModel::Rgb),
+            Object::Name(name) if name.as_slice() == b"DeviceCMYK" => Ok(ColorModel::Cmyk),
             Object::Array(values) => match values.first().and_then(|value| value.as_name().ok()) {
                 Some(b"CalGray") => Ok(ColorModel::Gray),
                 Some(b"CalRGB") => Ok(ColorModel::Rgb),
@@ -1204,6 +1486,7 @@ mod images {
                     {
                         Some(1) => Ok(ColorModel::Gray),
                         Some(3) => Ok(ColorModel::Rgb),
+                        Some(4) => Ok(ColorModel::Cmyk),
                         _ => Err(ImageSkipReason::UnsupportedColorSpace),
                     }
                 }
@@ -1227,16 +1510,14 @@ mod images {
         let width = positive_dimension(&stream.dict, b"Width").ok_or(ImageSkipReason::InvalidDimensions)?;
         let height = positive_dimension(&stream.dict, b"Height").ok_or(ImageSkipReason::InvalidDimensions)?;
         let stream_filters = filters(stream);
-        if stream_filters == [b"DCTDecode".as_slice()] {
+        let jpeg_filters = stream_filters == [b"DCTDecode".as_slice()]
+            || stream_filters == [b"ASCII85Decode".as_slice(), b"DCTDecode".as_slice()];
+        if jpeg_filters {
             if bits != 8 {
                 return Err(ImageSkipReason::UnsupportedBitsPerComponent);
             }
-            let decoded = image::load_from_memory_with_format(&stream.content, ImageFormat::Jpeg)
-                .map_err(|_| ImageSkipReason::DecodeFailed)?;
-            return Ok(match model {
-                ColorModel::Gray => Pixels::Gray(decoded.into_luma8()),
-                ColorModel::Rgb => Pixels::Rgb(decoded.into_rgb8()),
-            });
+            let jpeg = jpeg_content(stream, &stream_filters, max_bytes)?;
+            return decode_jpeg_pixels(&jpeg, model, width, height, max_bytes);
         }
         if stream_filters.iter().any(|filter| {
             !matches!(
@@ -1248,12 +1529,7 @@ mod images {
         }
         let raw = stream
             .decompressed_content_with_limit(max_bytes)
-            .map_err(|error| match error {
-                Error::Decompress(crate::DecompressError::MemoryLimitExceeded { .. }) => {
-                    ImageSkipReason::DecodeLimitExceeded
-                }
-                _ => ImageSkipReason::DecodeFailed,
-            })?;
+            .map_err(image_decode_error)?;
         match (model, bits) {
             (ColorModel::Gray, 1) => {
                 let bytes_per_row = usize::try_from(width).unwrap().div_ceil(8);
@@ -1277,7 +1553,100 @@ mod images {
             (ColorModel::Rgb, 8) => RgbImage::from_raw(width, height, raw)
                 .map(Pixels::Rgb)
                 .ok_or(ImageSkipReason::DecodeFailed),
+            (ColorModel::Cmyk, 8) => RgbaImage::from_raw(width, height, raw)
+                .map(Pixels::Cmyk)
+                .ok_or(ImageSkipReason::DecodeFailed),
             _ => Err(ImageSkipReason::UnsupportedBitsPerComponent),
+        }
+    }
+
+    fn apply_decode(dictionary: &Dictionary, pixels: &mut Pixels) -> std::result::Result<(), ImageSkipReason> {
+        let Ok(value) = dictionary.get(b"Decode") else {
+            return Ok(());
+        };
+        let values = value.as_array().map_err(|_| ImageSkipReason::DecodeFailed)?;
+        let channels = match pixels {
+            Pixels::Bitonal(_) | Pixels::Gray(_) => 1,
+            Pixels::Rgb(_) => 3,
+            Pixels::Cmyk(_) => 4,
+        };
+        if values.len() != channels * 2 {
+            return Err(ImageSkipReason::DecodeFailed);
+        }
+        let ranges: Vec<_> = values
+            .chunks_exact(2)
+            .map(|pair| {
+                let low = pair[0].as_float().map_err(|_| ImageSkipReason::DecodeFailed)?;
+                let high = pair[1].as_float().map_err(|_| ImageSkipReason::DecodeFailed)?;
+                if low.is_finite() && high.is_finite() {
+                    Ok((low, high))
+                } else {
+                    Err(ImageSkipReason::DecodeFailed)
+                }
+            })
+            .collect::<std::result::Result<_, _>>()?;
+        let raw: &mut [u8] = match pixels {
+            Pixels::Bitonal(image) | Pixels::Gray(image) => image.as_mut(),
+            Pixels::Rgb(image) => image.as_mut(),
+            Pixels::Cmyk(image) => image.as_mut(),
+        };
+        for (index, sample) in raw.iter_mut().enumerate() {
+            let (low, high) = ranges[index % channels];
+            let decoded = low + (high - low) * (f32::from(*sample) / 255.0);
+            *sample = (decoded * 255.0).round().clamp(0.0, 255.0) as u8;
+        }
+        Ok(())
+    }
+
+    fn decode_jpeg_pixels(
+        jpeg: &[u8], model: ColorModel, width: u32, height: u32, max_bytes: usize,
+    ) -> std::result::Result<Pixels, ImageSkipReason> {
+        let mut decoder = JpegDecoder::new(Cursor::new(jpeg));
+        decoder.set_max_decoding_buffer_size(max_bytes);
+        decoder.read_info().map_err(|_| ImageSkipReason::DecodeFailed)?;
+        let info = decoder.info().ok_or(ImageSkipReason::DecodeFailed)?;
+        if u32::from(info.width) != width || u32::from(info.height) != height {
+            return Err(ImageSkipReason::InvalidDimensions);
+        }
+        let decoded = decoder.decode().map_err(|_| ImageSkipReason::DecodeFailed)?;
+        match (model, info.pixel_format) {
+            (ColorModel::Gray, PixelFormat::L8) => GrayImage::from_raw(width, height, decoded)
+                .map(Pixels::Gray)
+                .ok_or(ImageSkipReason::DecodeFailed),
+            (ColorModel::Rgb, PixelFormat::RGB24) => RgbImage::from_raw(width, height, decoded)
+                .map(Pixels::Rgb)
+                .ok_or(ImageSkipReason::DecodeFailed),
+            (ColorModel::Cmyk, PixelFormat::CMYK32) => RgbaImage::from_raw(width, height, decoded)
+                .map(Pixels::Cmyk)
+                .ok_or(ImageSkipReason::DecodeFailed),
+            _ => Err(ImageSkipReason::DecodeFailed),
+        }
+    }
+
+    fn jpeg_content<'a>(
+        stream: &'a Stream, stream_filters: &[&[u8]], max_bytes: usize,
+    ) -> std::result::Result<Cow<'a, [u8]>, ImageSkipReason> {
+        if stream_filters == [b"DCTDecode".as_slice()] {
+            return Ok(Cow::Borrowed(stream.content.as_slice()));
+        }
+        if stream_filters == [b"ASCII85Decode".as_slice(), b"DCTDecode".as_slice()] {
+            let mut ascii85 = stream.clone();
+            ascii85.dict.set("Filter", "ASCII85Decode");
+            ascii85.dict.remove(b"DecodeParms");
+            return ascii85
+                .decompressed_content_with_limit(max_bytes)
+                .map(Cow::Owned)
+                .map_err(image_decode_error);
+        }
+        Err(ImageSkipReason::UnsupportedFilter)
+    }
+
+    fn image_decode_error(error: Error) -> ImageSkipReason {
+        match error {
+            Error::Decompress(crate::DecompressError::MemoryLimitExceeded { .. }) => {
+                ImageSkipReason::DecodeLimitExceeded
+            }
+            _ => ImageSkipReason::DecodeFailed,
         }
     }
 
@@ -1295,9 +1664,9 @@ mod images {
         let mut dictionary = original.dict.clone();
         dictionary.set("Width", width);
         dictionary.set("Height", height);
+        dictionary.remove(b"Decode");
         dictionary.remove(b"DecodeParms");
         dictionary.remove(b"Filter");
-
         match effective {
             ImageRecompression::Never | ImageRecompression::Preserve { .. } => Err(ImageSkipReason::PolicyDisabled),
             ImageRecompression::Jpeg { quality } => {
@@ -1313,7 +1682,7 @@ mod images {
                 let width = u16::try_from(width).map_err(|_| ImageSkipReason::InvalidDimensions)?;
                 let height = u16::try_from(height).map_err(|_| ImageSkipReason::InvalidDimensions)?;
                 let mut encoder = JpegEncoder::new(&mut encoded, quality.clamp(1, 100));
-                encoder.set_sampling_factor(SamplingFactor::R_4_2_0);
+                encoder.set_sampling_factor(SamplingFactor::R_4_4_4);
                 encoder.set_optimized_huffman_tables(true);
                 match pixels {
                     Pixels::Bitonal(image) | Pixels::Gray(image) => encoder
@@ -1321,6 +1690,9 @@ mod images {
                         .map_err(|_| ImageSkipReason::DecodeFailed)?,
                     Pixels::Rgb(image) => encoder
                         .encode(image.as_raw(), width, height, JpegColorType::Rgb)
+                        .map_err(|_| ImageSkipReason::DecodeFailed)?,
+                    Pixels::Cmyk(image) => encoder
+                        .encode(image.as_raw(), width, height, JpegColorType::Cmyk)
                         .map_err(|_| ImageSkipReason::DecodeFailed)?,
                 }
                 dictionary.set("BitsPerComponent", 8);
@@ -1352,6 +1724,10 @@ mod images {
                 image.into_raw()
             }
             Pixels::Rgb(image) => {
+                dictionary.set("BitsPerComponent", 8);
+                image.into_raw()
+            }
+            Pixels::Cmyk(image) => {
                 dictionary.set("BitsPerComponent", 8);
                 image.into_raw()
             }

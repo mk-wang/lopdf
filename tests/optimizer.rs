@@ -2,7 +2,10 @@
 
 use image::codecs::jpeg::JpegEncoder;
 use image::{ExtendedColorType, RgbImage};
+use jpeg_decoder::{Decoder as JpegDecoder, PixelFormat};
+use jpeg_encoder::ColorType as JpegColorType;
 use lopdf::{Dictionary, Document, Object, OptimizeOptions, Stream, content::Content, dictionary};
+use std::io::Cursor;
 
 #[test]
 fn structural_optimization_deduplicates_dictionary_order_independently() {
@@ -33,6 +36,38 @@ fn structural_optimization_deduplicates_dictionary_order_independently() {
     assert_eq!(
         catalog.get(b"First").and_then(Object::as_reference).unwrap(),
         catalog.get(b"Second").and_then(Object::as_reference).unwrap()
+    );
+}
+
+#[test]
+fn structural_dedup_rewrites_unreachable_object_graphs() {
+    let mut document = Document::with_version("1.7");
+    let first = document.add_object(dictionary! { "Value" => 7 });
+    let duplicate = document.add_object(dictionary! { "Value" => 7 });
+    let holder = document.add_object(dictionary! { "Reference" => duplicate });
+    let catalog = document.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Value" => first,
+    });
+    document.trailer.set("Root", catalog);
+
+    let options = OptimizeOptions {
+        prune_unused_objects: false,
+        renumber_objects: false,
+        ..OptimizeOptions::default()
+    };
+    document.optimize(&options).unwrap();
+
+    assert!(document.get_object(duplicate).is_err());
+    assert_eq!(
+        document
+            .get_dictionary(holder)
+            .unwrap()
+            .get(b"Reference")
+            .unwrap()
+            .as_reference()
+            .unwrap(),
+        first
     );
 }
 
@@ -199,6 +234,138 @@ fn shared_image_keeps_resolution_needed_by_its_largest_use() {
     let image = document.get_object(image_id).unwrap().as_stream().unwrap();
     assert_eq!(image.dict.get(b"Width").and_then(Object::as_i64).unwrap(), 600);
     assert_eq!(image.dict.get(b"Height").and_then(Object::as_i64).unwrap(), 600);
+}
+
+#[test]
+fn image_in_annotation_appearance_protects_resize() {
+    let (mut document, image_id) = image_document(&[1.0], false);
+    let appearance_id = document.add_object(Stream::new(
+        dictionary! {
+            "Type" => "XObject",
+            "Subtype" => "Form",
+            "BBox" => vec![0.into(), 0.into(), 1.into(), 1.into()],
+            "Resources" => dictionary! {
+                "XObject" => dictionary! { "Im0" => image_id },
+            },
+        },
+        b"/Im0 Do".to_vec(),
+    ));
+    let annotation_id = document.add_object(dictionary! {
+        "Type" => "Annot",
+        "Subtype" => "Widget",
+        "AP" => dictionary! { "N" => appearance_id },
+    });
+    let page_id = *document.get_pages().values().next().unwrap();
+    document
+        .get_dictionary_mut(page_id)
+        .unwrap()
+        .set("Annots", vec![annotation_id.into()]);
+
+    let mut options = OptimizeOptions::maximum_compression();
+    options.renumber_objects = false;
+    let report = document.optimize(&options).unwrap();
+
+    assert_eq!(report.images.rewritten_images, 1);
+    assert_eq!(report.images.resized_images, 0);
+    assert_eq!(
+        document
+            .get_object(image_id)
+            .unwrap()
+            .as_stream()
+            .unwrap()
+            .dict
+            .get(b"Width")
+            .unwrap()
+            .as_i64()
+            .unwrap(),
+        600
+    );
+}
+
+#[test]
+fn image_optimization_rewrites_ascii85_wrapped_jpegs() {
+    let (mut document, image_id) = image_document(&[72.0], false);
+    let image = document.get_object_mut(image_id).unwrap().as_stream_mut().unwrap();
+    let jpeg = std::mem::take(&mut image.content);
+    image.dict.set(
+        "Filter",
+        vec![
+            Object::Name(b"ASCII85Decode".to_vec()),
+            Object::Name(b"DCTDecode".to_vec()),
+        ],
+    );
+    image.set_content(ascii85_encode(&jpeg));
+
+    let mut options = OptimizeOptions::maximum_compression();
+    options.renumber_objects = false;
+    let report = document.optimize(&options).unwrap();
+
+    assert_eq!(report.images.rewritten_images, 1);
+    let image = document.get_object(image_id).unwrap().as_stream().unwrap();
+    assert_eq!(
+        image.dict.get(b"Filter").and_then(Object::as_name).unwrap(),
+        b"DCTDecode"
+    );
+    assert_eq!(&image.content[..2], &[0xff, 0xd8]);
+}
+#[test]
+fn image_mode_rewrites_iccbased_cmyk_jpegs_as_cmyk() {
+    let (mut document, image_id) = image_document(&[72.0], false);
+    let profile_id = document.add_object(Stream::new(
+        dictionary! {
+            "N" => 4,
+            "Alternate" => "DeviceCMYK",
+        },
+        Vec::new(),
+    ));
+    let mut image = cmyk_image_stream();
+    image.dict.set(
+        "Decode",
+        vec![
+            1.into(),
+            0.into(),
+            1.into(),
+            0.into(),
+            1.into(),
+            0.into(),
+            1.into(),
+            0.into(),
+        ],
+    );
+    image.dict.set(
+        "ColorSpace",
+        vec![Object::Name(b"ICCBased".to_vec()), profile_id.into()],
+    );
+    *document.get_object_mut(image_id).unwrap() = image.into();
+
+    let mut options = OptimizeOptions::image();
+    options.renumber_objects = false;
+    let report = document.optimize(&options).unwrap();
+
+    assert_eq!(report.images.rewritten_images, 1);
+    assert_eq!(report.images.resized_images, 1);
+    let image = document.get_object(image_id).unwrap().as_stream().unwrap();
+    assert_eq!(image.dict.get(b"Width").and_then(Object::as_i64).unwrap(), 120);
+    assert_eq!(image.dict.get(b"Height").and_then(Object::as_i64).unwrap(), 120);
+    assert!(!image.dict.has(b"Decode"));
+    assert_eq!(
+        image
+            .dict
+            .get(b"ColorSpace")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .first()
+            .and_then(|value| value.as_name().ok())
+            .unwrap(),
+        b"ICCBased"
+    );
+
+    let mut decoder = JpegDecoder::new(Cursor::new(&image.content));
+    let decoded = decoder.decode().unwrap();
+    let info = decoder.info().unwrap();
+    assert_eq!(info.pixel_format, PixelFormat::CMYK32);
+    assert_eq!(decoded.len(), 120 * 120 * 4);
 }
 
 #[test]
@@ -402,4 +569,56 @@ fn jpeg_image_stream() -> Stream {
         },
         jpeg,
     )
+}
+fn cmyk_image_stream() -> Stream {
+    let mut pixels = Vec::with_capacity(600 * 600 * 4);
+    for y in 0..600_u32 {
+        for x in 0..600_u32 {
+            pixels.extend_from_slice(&[
+                (x % 256) as u8,
+                (y % 256) as u8,
+                ((x.wrapping_mul(17) + y.wrapping_mul(31)) % 256) as u8,
+                32,
+            ]);
+        }
+    }
+    let mut jpeg = Vec::new();
+    jpeg_encoder::Encoder::new(&mut jpeg, 95)
+        .encode(&pixels, 600, 600, JpegColorType::Cmyk)
+        .unwrap();
+    Stream::new(
+        dictionary! {
+            "Type" => "XObject",
+            "Subtype" => "Image",
+            "Width" => 600,
+            "Height" => 600,
+            "ColorSpace" => "DeviceCMYK",
+            "BitsPerComponent" => 8,
+            "Filter" => "DCTDecode",
+        },
+        jpeg,
+    )
+}
+
+fn ascii85_encode(input: &[u8]) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(input.len() * 5 / 4 + 2);
+    for chunk in input.chunks(4) {
+        let mut value = 0_u32;
+        for byte in chunk {
+            value = (value << 8) | u32::from(*byte);
+        }
+        value <<= (4 - chunk.len()) * 8;
+        if chunk.len() == 4 && value == 0 {
+            encoded.push(b'z');
+            continue;
+        }
+        let mut digits = [b'!'; 5];
+        for digit in digits.iter_mut().rev() {
+            *digit = (value % 85) as u8 + b'!';
+            value /= 85;
+        }
+        encoded.extend_from_slice(&digits[..chunk.len() + 1]);
+    }
+    encoded.extend_from_slice(b"~>");
+    encoded
 }
