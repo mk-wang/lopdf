@@ -252,12 +252,12 @@ impl Document {
         refs
     }
 
-    /// Return dictionary with encryption information
+    /// Return the encryption dictionary, whether it is stored directly in the trailer or by reference.
     pub fn get_encrypted(&self) -> Result<&Dictionary> {
-        self.trailer
-            .get(b"Encrypt")
-            .and_then(Object::as_reference)
-            .and_then(|id| self.get_dictionary(id))
+        match self.trailer.get(b"Encrypt")? {
+            Object::Reference(id) => self.get_dictionary(*id),
+            object => object.as_dict(),
+        }
     }
 
     /// Return true if PDF document is currently encrypted

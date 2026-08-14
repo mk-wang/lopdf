@@ -3,12 +3,19 @@ use crate::content::Content;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use subsetter::{GlyphRemapper, subset};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FontProgramKind {
+    TrueType,
+    Cff,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct FontCandidate {
     font_id: ObjectId,
     descendant_id: ObjectId,
     descriptor_id: ObjectId,
     font_file_id: ObjectId,
+    kind: FontProgramKind,
 }
 
 #[derive(Debug, Default)]
@@ -159,18 +166,40 @@ impl Document {
                     continue;
                 }
             };
-            let glyph_list: Vec<_> = glyphs.iter().copied().collect();
-            let remapper = GlyphRemapper::new_from_glyphs_sorted(&glyph_list);
-            let normalized_font_data = normalize_sfnt_table_directory(&font_data);
-            let subset_source = normalized_font_data.as_deref().unwrap_or(&font_data);
-            let subset_data = match subset(subset_source, 0, &remapper) {
-                Ok(data) => data,
-                Err(_) => {
-                    for _ in candidates {
-                        report.skip(FontSkipReason::SubsetFailed);
-                    }
-                    continue;
+            let kind = candidates.first().map(|(candidate, _)| candidate.kind).unwrap();
+            if candidates.iter().any(|(candidate, _)| candidate.kind != kind) {
+                for _ in candidates {
+                    report.skip(FontSkipReason::UnsupportedFont);
                 }
+                continue;
+            }
+            let subset_glyphs = match kind {
+                FontProgramKind::TrueType => glyphs.clone(),
+                FontProgramKind::Cff => {
+                    let Some(glyphs) = identity_cff_glyphs(&font_data, &glyphs) else {
+                        for _ in candidates {
+                            report.skip(FontSkipReason::UnsupportedFont);
+                        }
+                        continue;
+                    };
+                    glyphs
+                }
+            };
+            let glyph_list: Vec<_> = subset_glyphs.iter().copied().collect();
+            let remapper = GlyphRemapper::new_from_glyphs_sorted(&glyph_list);
+            let subset_data = match kind {
+                FontProgramKind::TrueType => {
+                    let normalized_font_data = normalize_sfnt_table_directory(&font_data);
+                    let subset_source = normalized_font_data.as_deref().unwrap_or(&font_data);
+                    subset(subset_source, 0, &remapper).ok()
+                }
+                FontProgramKind::Cff => subset_cff_program(&font_data, &remapper),
+            };
+            let Some(subset_data) = subset_data else {
+                for _ in candidates {
+                    report.skip(FontSkipReason::SubsetFailed);
+                }
+                continue;
             };
             let subset_length = subset_data.len();
             let mut dictionary = old_stream.dict.clone();
@@ -187,14 +216,15 @@ impl Document {
                 continue;
             }
 
-            let cid_to_gid = self.add_object(cid_to_gid_stream(&glyphs, &remapper));
-            let cid_set = self.add_object(cid_set_stream(&glyphs));
+            let cid_to_gid =
+                (kind == FontProgramKind::TrueType).then(|| self.add_object(cid_to_gid_stream(&glyphs, &remapper)));
+            let cid_set = self.add_object(cid_set_stream(&subset_glyphs));
             let mut updated_descendants = HashSet::new();
             let mut updated_descriptors = HashSet::new();
             for (candidate, _) in &candidates {
-                if updated_descendants.insert(candidate.descendant_id) {
+                if kind == FontProgramKind::TrueType && updated_descendants.insert(candidate.descendant_id) {
                     self.get_dictionary_mut(candidate.descendant_id)?
-                        .set("CIDToGIDMap", cid_to_gid);
+                        .set("CIDToGIDMap", cid_to_gid.expect("TrueType CIDToGIDMap"));
                 }
                 if updated_descriptors.insert(candidate.descriptor_id) {
                     self.get_dictionary_mut(candidate.descriptor_id)?.set("CIDSet", cid_set);
@@ -577,14 +607,6 @@ fn font_candidate(document: &Document, font_id: ObjectId) -> std::result::Result
     let descendant = document
         .get_dictionary(descendant_id)
         .map_err(|_| FontSkipReason::UnsupportedFont)?;
-    if descendant.get(b"Subtype").and_then(Object::as_name).ok() != Some(b"CIDFontType2") {
-        return Err(FontSkipReason::UnsupportedFont);
-    }
-    if let Ok(mapping) = descendant.get(b"CIDToGIDMap")
-        && mapping.as_name().ok() != Some(b"Identity")
-    {
-        return Err(FontSkipReason::UnsupportedCidMapping);
-    }
     let descriptor_id = descendant
         .get(b"FontDescriptor")
         .and_then(Object::as_reference)
@@ -592,37 +614,45 @@ fn font_candidate(document: &Document, font_id: ObjectId) -> std::result::Result
     let descriptor = document
         .get_dictionary(descriptor_id)
         .map_err(|_| FontSkipReason::MissingFontProgram)?;
+    let (font_file_key, kind) = match descendant.get(b"Subtype").and_then(Object::as_name).ok() {
+        Some(b"CIDFontType2") => {
+            if let Ok(mapping) = descendant.get(b"CIDToGIDMap")
+                && mapping.as_name().ok() != Some(b"Identity")
+            {
+                return Err(FontSkipReason::UnsupportedCidMapping);
+            }
+            (b"FontFile2".as_slice(), FontProgramKind::TrueType)
+        }
+        Some(b"CIDFontType0") => (b"FontFile3".as_slice(), FontProgramKind::Cff),
+        _ => return Err(FontSkipReason::UnsupportedFont),
+    };
     let font_file_id = descriptor
-        .get(b"FontFile2")
+        .get(font_file_key)
         .and_then(Object::as_reference)
         .map_err(|_| FontSkipReason::MissingFontProgram)?;
+    if kind == FontProgramKind::Cff
+        && document
+            .get_object(font_file_id)
+            .ok()
+            .and_then(|object| object.as_stream().ok())
+            .and_then(|stream| stream.dict.get(b"Subtype").ok())
+            .and_then(|subtype| subtype.as_name().ok())
+            != Some(b"CIDFontType0C")
+    {
+        return Err(FontSkipReason::UnsupportedFont);
+    }
     Ok(FontCandidate {
         font_id,
         descendant_id,
         descriptor_id,
         font_file_id,
+        kind,
     })
 }
 fn font_file_id_for_type0(document: &Document, font_id: ObjectId) -> Option<ObjectId> {
-    let descendants = document
-        .get_dictionary(font_id)
-        .ok()?
-        .get(b"DescendantFonts")
-        .and_then(Object::as_array)
-        .ok()?;
-    let descendant_id = descendants.first()?.as_reference().ok()?;
-    let descriptor_id = document
-        .get_dictionary(descendant_id)
-        .ok()?
-        .get(b"FontDescriptor")
-        .and_then(Object::as_reference)
-        .ok()?;
-    document
-        .get_dictionary(descriptor_id)
-        .ok()?
-        .get(b"FontFile2")
-        .and_then(Object::as_reference)
+    font_candidate(document, font_id)
         .ok()
+        .map(|candidate| candidate.font_file_id)
 }
 
 fn font_file_descriptors(document: &Document) -> BTreeMap<ObjectId, HashSet<ObjectId>> {
@@ -631,8 +661,10 @@ fn font_file_descriptors(document: &Document) -> BTreeMap<ObjectId, HashSet<Obje
         let Some(dictionary) = object_dictionary(object) else {
             continue;
         };
-        if let Ok(font_file_id) = dictionary.get(b"FontFile2").and_then(Object::as_reference) {
-            result.entry(font_file_id).or_default().insert(id);
+        for key in [b"FontFile2".as_slice(), b"FontFile3".as_slice()] {
+            if let Ok(font_file_id) = dictionary.get(key).and_then(Object::as_reference) {
+                result.entry(font_file_id).or_default().insert(id);
+            }
         }
     }
     result
@@ -667,6 +699,126 @@ fn normalize_sfnt_table_directory(font_data: &[u8]) -> Option<Vec<u8>> {
         target.copy_from_slice(&record);
     }
     Some(normalized)
+}
+
+// CIDFontType0 has no CIDToGIDMap. Keep a contiguous GID prefix so the
+// subsetter's GID-to-CID identity mapping preserves every PDF character code.
+// Sparse high GIDs are left untouched instead of retaining a huge prefix.
+const MAX_IDENTITY_CFF_GLYPHS: u16 = 8192;
+
+fn identity_cff_glyphs(font_data: &[u8], used_glyphs: &BTreeSet<u16>) -> Option<BTreeSet<u16>> {
+    if !cff_is_name_keyed(font_data)? {
+        return None;
+    }
+    let max_glyph = used_glyphs.last().copied().unwrap_or(0);
+    if max_glyph >= MAX_IDENTITY_CFF_GLYPHS {
+        return None;
+    }
+    Some((0..=max_glyph).collect())
+}
+
+fn subset_cff_program(font_data: &[u8], remapper: &GlyphRemapper) -> Option<Vec<u8>> {
+    let font_length = u32::try_from(font_data.len()).ok()?;
+    let mut sfnt = Vec::with_capacity(28usize.checked_add(font_data.len())?.checked_add(3)?);
+    sfnt.extend_from_slice(b"OTTO");
+    sfnt.extend_from_slice(&1u16.to_be_bytes());
+    sfnt.extend_from_slice(&16u16.to_be_bytes());
+    sfnt.extend_from_slice(&0u16.to_be_bytes());
+    sfnt.extend_from_slice(&0u16.to_be_bytes());
+    sfnt.extend_from_slice(b"CFF ");
+    sfnt.extend_from_slice(&0u32.to_be_bytes());
+    sfnt.extend_from_slice(&28u32.to_be_bytes());
+    sfnt.extend_from_slice(&font_length.to_be_bytes());
+    sfnt.extend_from_slice(font_data);
+    while sfnt.len() % 4 != 0 {
+        sfnt.push(0);
+    }
+
+    let subset = subset(&sfnt, 0, remapper).ok()?;
+    sfnt_table(&subset, b"CFF ").map(ToOwned::to_owned)
+}
+
+fn sfnt_table<'a>(font_data: &'a [u8], tag: &[u8; 4]) -> Option<&'a [u8]> {
+    let table_count = u16::from_be_bytes(font_data.get(4..6)?.try_into().ok()?) as usize;
+    let directory_end = 12usize.checked_add(table_count.checked_mul(16)?)?;
+    let directory = font_data.get(12..directory_end)?;
+    for record in directory.chunks_exact(16) {
+        if record.get(..4)? != tag {
+            continue;
+        }
+        let offset = u32::from_be_bytes(record.get(8..12)?.try_into().ok()?) as usize;
+        let length = u32::from_be_bytes(record.get(12..16)?.try_into().ok()?) as usize;
+        return font_data.get(offset..offset.checked_add(length)?);
+    }
+    None
+}
+
+fn cff_is_name_keyed(font_data: &[u8]) -> Option<bool> {
+    let header_size = *font_data.get(2)? as usize;
+    let (_, after_names) = cff_index_first(font_data, header_size)?;
+    let (top_dict, _) = cff_index_first(font_data, after_names)?;
+    let top_dict = top_dict?;
+    let mut offset = 0;
+    while offset < top_dict.len() {
+        let byte = top_dict[offset];
+        match byte {
+            12 => {
+                if *top_dict.get(offset + 1)? == 30 {
+                    return Some(false);
+                }
+                offset += 2;
+            }
+            0..=21 => offset += 1,
+            28 => offset = offset.checked_add(3)?,
+            29 | 255 => offset = offset.checked_add(5)?,
+            30 => {
+                offset += 1;
+                loop {
+                    let pair = *top_dict.get(offset)?;
+                    offset += 1;
+                    if pair >> 4 == 0x0f || pair & 0x0f == 0x0f {
+                        break;
+                    }
+                }
+            }
+            32..=246 => offset += 1,
+            247..=254 => offset = offset.checked_add(2)?,
+            _ => return None,
+        }
+    }
+    Some(true)
+}
+
+fn cff_index_first(font_data: &[u8], offset: usize) -> Option<(Option<&[u8]>, usize)> {
+    let count = u16::from_be_bytes(font_data.get(offset..offset + 2)?.try_into().ok()?) as usize;
+    if count == 0 {
+        return Some((None, offset.checked_add(2)?));
+    }
+    let off_size = *font_data.get(offset + 2)? as usize;
+    if !(1..=4).contains(&off_size) {
+        return None;
+    }
+    let offsets_start = offset.checked_add(3)?;
+    let offsets_len = count.checked_add(1)?.checked_mul(off_size)?;
+    let data_start = offsets_start.checked_add(offsets_len)?;
+    let first = cff_offset(font_data.get(offsets_start..offsets_start + off_size)?)?;
+    let second_start = offsets_start.checked_add(off_size)?;
+    let second = cff_offset(font_data.get(second_start..second_start + off_size)?)?;
+    let last_start = offsets_start.checked_add(count.checked_mul(off_size)?)?;
+    let last = cff_offset(font_data.get(last_start..last_start + off_size)?)?;
+    if first == 0 || second < first || last < second {
+        return None;
+    }
+    let object_start = data_start.checked_add(first - 1)?;
+    let object_end = data_start.checked_add(second - 1)?;
+    let index_end = data_start.checked_add(last - 1)?;
+    Some((Some(font_data.get(object_start..object_end)?), index_end))
+}
+
+fn cff_offset(bytes: &[u8]) -> Option<usize> {
+    bytes.iter().try_fold(0usize, |value, byte| {
+        value.checked_mul(256)?.checked_add(*byte as usize)
+    })
 }
 
 fn cid_to_gid_stream(glyphs: &BTreeSet<u16>, remapper: &GlyphRemapper) -> Stream {

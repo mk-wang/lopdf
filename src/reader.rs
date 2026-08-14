@@ -24,7 +24,7 @@ use crate::error::{ParseError, XrefError};
 use crate::load_options::{FilterFunc, LoadOptions};
 use crate::object_stream::ObjectStream;
 use crate::parser;
-use crate::xref::{Xref, XrefEntry};
+use crate::xref::{Xref, XrefEntry, XrefType};
 use crate::{Dictionary, Document, Error, IncrementalDocument, Object, ObjectId, Result};
 
 #[cfg(not(feature = "async"))]
@@ -568,12 +568,7 @@ impl Reader<'_> {
 
         let version = parser::header(self.buffer, self.strict).ok_or(ParseError::InvalidFileHeader)?;
 
-        let xref_start = Self::get_xref_start(self.buffer)?;
-        if xref_start > self.buffer.len() {
-            return Err(Error::Xref(XrefError::Start));
-        }
-
-        let (mut xref, mut trailer) = self.xref_and_trailer_at(xref_start)?;
+        let (_, mut xref, mut trailer) = self.initial_xref_and_trailer()?;
 
         let mut already_seen = HashSet::new();
         let mut prev_xref_start = trailer.remove(b"Prev");
@@ -803,14 +798,8 @@ impl Reader<'_> {
             self.document.binary_mark = binary_mark;
         }
 
-        let xref_start = Self::get_xref_start(self.buffer)?;
-        if xref_start > self.buffer.len() {
-            return Err(Error::Xref(XrefError::Start));
-        }
-        let xref_start = self.correct_xref_offset(xref_start);
+        let (xref_start, mut xref, mut trailer) = self.initial_xref_and_trailer()?;
         self.document.xref_start = xref_start;
-
-        let (mut xref, mut trailer) = self.xref_and_trailer_at(xref_start)?;
 
         // Read previous Xrefs of linearized or incremental updated document.
         let mut already_seen = HashSet::new();
@@ -1314,6 +1303,153 @@ impl Reader<'_> {
         parser::indirect_object(self.buffer, offset, expected_id, self, already_seen)
     }
 
+    fn initial_xref_and_trailer(&mut self) -> Result<(usize, Xref, Dictionary)> {
+        if self.strict {
+            let xref_start = Self::get_xref_start(self.buffer)?;
+            if xref_start > self.buffer.len() {
+                return Err(Error::Xref(XrefError::Start));
+            }
+            let xref_start = self.correct_xref_offset(xref_start);
+            let (xref, trailer) = parser::xref_and_trailer(&self.buffer[xref_start..], self)?;
+            return Ok((xref_start, xref, trailer));
+        }
+
+        let parsed = Self::get_xref_start(self.buffer)
+            .ok()
+            .filter(|&xref_start| xref_start <= self.buffer.len())
+            .map(|xref_start| {
+                let xref_start = self.correct_xref_offset(xref_start);
+                parser::xref_and_trailer(&self.buffer[xref_start..], self)
+                    .map(|(xref, trailer)| (xref_start, xref, trailer))
+            });
+        match parsed {
+            Some(Ok(result)) => Ok(result),
+            Some(Err(error))
+                if matches!(
+                    &error,
+                    Error::Decompress(crate::DecompressError::MemoryLimitExceeded { .. })
+                ) =>
+            {
+                Err(error)
+            }
+            _ => {
+                let (xref, trailer) = self.recover_xref_and_trailer()?;
+                Ok((0, xref, trailer))
+            }
+        }
+    }
+
+    fn recover_xref_and_trailer(&mut self) -> Result<(Xref, Dictionary)> {
+        let mut provisional = Xref::new(1, XrefType::CrossReferenceTable);
+        provisional.insert(0, XrefEntry::Free);
+        for (obj_position, keyword) in self.buffer.windows(3).enumerate() {
+            if keyword != b"obj" {
+                continue;
+            }
+            let Some(((number, generation), offset)) = Self::object_header_before(self.buffer, obj_position) else {
+                continue;
+            };
+            let Ok(offset) = u32::try_from(offset) else {
+                continue;
+            };
+            provisional.insert(number, XrefEntry::Normal { offset, generation });
+        }
+        if provisional.entries.len() == 1 {
+            return Err(Error::Xref(XrefError::Start));
+        }
+
+        self.document.reference_table = provisional.clone();
+        let mut recovered = Xref::new(1, XrefType::CrossReferenceTable);
+        recovered.insert(0, XrefEntry::Free);
+        let mut catalog = None;
+        for (&number, entry) in &provisional.entries {
+            let XrefEntry::Normal { offset, generation } = *entry else {
+                continue;
+            };
+            let id = (number, generation);
+            let Ok((_, object)) = self.read_object(offset as usize, Some(id), &mut HashSet::new()) else {
+                continue;
+            };
+            recovered.insert(number, entry.clone());
+            if object
+                .as_dict()
+                .ok()
+                .is_some_and(|dictionary| dictionary.get_type().ok() == Some(b"Catalog"))
+                && catalog.is_none_or(|(best_offset, _)| offset > best_offset)
+            {
+                catalog = Some((offset, id));
+            }
+        }
+
+        let Some((_, catalog_id)) = catalog else {
+            return Err(Error::Xref(XrefError::Start));
+        };
+        self.document.reference_table = recovered.clone();
+        let mut trailer = self.recover_trailer_dictionary().unwrap_or_default();
+        let root_is_valid = trailer
+            .get(b"Root")
+            .and_then(Object::as_reference)
+            .ok()
+            .is_some_and(|(number, _)| recovered.get(number).is_some());
+        if !root_is_valid {
+            trailer.set("Root", catalog_id);
+        }
+        trailer.set("Size", recovered.size as i64);
+        warn!(
+            "Cross-reference table is missing; recovered {} indirect objects.",
+            recovered.entries.len().saturating_sub(1)
+        );
+        Ok((recovered, trailer))
+    }
+
+    fn recover_trailer_dictionary(&self) -> Option<Dictionary> {
+        let position = Self::search_substring(self.buffer, b"trailer", 0)?;
+        parser::direct_object(&self.buffer[position + b"trailer".len()..])?
+            .as_dict()
+            .ok()
+            .cloned()
+    }
+
+    fn object_header_before(buffer: &[u8], obj_position: usize) -> Option<(ObjectId, usize)> {
+        if buffer.get(obj_position..obj_position + 3)? != b"obj" {
+            return None;
+        }
+        if buffer
+            .get(obj_position + 3)
+            .is_some_and(|byte| !Self::is_pdf_delimiter(*byte))
+        {
+            return None;
+        }
+        let (generation, generation_start) = Self::number_before(buffer, obj_position)?;
+        let (number, number_start) = Self::number_before(buffer, generation_start)?;
+        let number = u32::try_from(number).ok()?;
+        let generation = u16::try_from(generation).ok()?;
+        (number != 0).then_some(((number, generation), number_start))
+    }
+
+    fn number_before(buffer: &[u8], end: usize) -> Option<(u64, usize)> {
+        let mut cursor = end;
+        while cursor > 0 && buffer[cursor - 1].is_ascii_whitespace() {
+            cursor -= 1;
+        }
+        if cursor == end {
+            return None;
+        }
+        let digits_end = cursor;
+        while cursor > 0 && buffer[cursor - 1].is_ascii_digit() {
+            cursor -= 1;
+        }
+        if cursor == digits_end {
+            return None;
+        }
+        let number = std::str::from_utf8(&buffer[cursor..digits_end]).ok()?.parse().ok()?;
+        Some((number, cursor))
+    }
+
+    fn is_pdf_delimiter(byte: u8) -> bool {
+        byte.is_ascii_whitespace() || b"()<>[]{}/%".contains(&byte)
+    }
+
     /// Parse the cross-reference section recorded at `offset`, first correcting
     /// the offset if it is slightly miswritten (lenient mode only).
     fn xref_and_trailer_at(&self, offset: usize) -> Result<(Xref, Dictionary)> {
@@ -1322,12 +1458,9 @@ impl Reader<'_> {
     }
 
     /// Some generators write `startxref` (or trailer `Prev`) values that are
-    /// slightly off — most commonly the offset of the line *after* the `xref`
-    /// keyword instead of the keyword itself. Such files are otherwise intact,
-    /// and common readers (Acrobat, poppler, mupdf, pdf.js) recover from them.
-    /// In lenient mode, if `offset` does not point at a cross-reference table
-    /// or an indirect object (cross-reference stream), scan a small window
-    /// around it for the `xref` keyword and use the nearest match instead.
+    /// slightly off, or replace them with zero. In lenient mode, recover a
+    /// nearby cross-reference table first, then fall back to the final standalone
+    /// `xref` keyword in the document.
     fn correct_xref_offset(&self, offset: usize) -> usize {
         const RECOVERY_WINDOW: usize = 64;
 
@@ -1341,29 +1474,37 @@ impl Reader<'_> {
 
         let window_start = offset.saturating_sub(RECOVERY_WINDOW);
         let window_end = cmp::min(self.buffer.len(), offset + RECOVERY_WINDOW);
-        let mut corrected: Option<usize> = None;
-        for pos in window_start..window_end.saturating_sub(4) {
-            if !self.buffer[pos..].starts_with(b"xref") {
-                continue;
-            }
-            // `startxref` contains `xref`; never match inside it.
-            if pos >= 5 && &self.buffer[pos - 5..pos] == b"start" {
-                continue;
-            }
-            if corrected.is_none_or(|best: usize| pos.abs_diff(offset) < best.abs_diff(offset)) {
-                corrected = Some(pos);
-            }
-        }
+        let corrected = (window_start..window_end.saturating_sub(3))
+            .filter(|&pos| self.is_xref_keyword_at(pos))
+            .min_by_key(|&pos| pos.abs_diff(offset))
+            .or_else(|| {
+                self.buffer
+                    .windows(4)
+                    .enumerate()
+                    .rev()
+                    .find_map(|(pos, _)| self.is_xref_keyword_at(pos).then_some(pos))
+            });
         match corrected {
             Some(pos) => {
                 warn!(
-                    "Cross-reference offset {} does not point at an xref section; using nearby offset {} instead.",
+                    "Cross-reference offset {} does not point at an xref section; using offset {} instead.",
                     offset, pos
                 );
                 pos
             }
             None => offset,
         }
+    }
+
+    fn is_xref_keyword_at(&self, position: usize) -> bool {
+        self.buffer
+            .get(position..position + 4)
+            .is_some_and(|keyword| keyword == b"xref")
+            && !(position >= 5 && &self.buffer[position - 5..position] == b"start")
+            && self
+                .buffer
+                .get(position + 4)
+                .is_none_or(|byte| Self::is_pdf_delimiter(*byte))
     }
 
     /// Whether `input` begins with an indirect-object header (`N G obj`), the
@@ -1388,10 +1529,9 @@ impl Reader<'_> {
     }
 
     fn get_xref_start(buffer: &[u8]) -> Result<usize> {
-        let seek_pos = buffer.len() - cmp::min(buffer.len(), 512);
-        Self::search_substring(buffer, b"%%EOF", seek_pos)
+        Self::search_substring(buffer, b"%%EOF", 0)
             .filter(|&eof_pos| eof_pos > 25)
-            .and_then(|eof_pos| Self::search_substring(&buffer[..eof_pos], b"startxref", eof_pos - 25))
+            .and_then(|eof_pos| Self::search_substring(&buffer[..eof_pos], b"startxref", 0))
             .ok_or(Error::Xref(XrefError::Start))
             .and_then(|xref_pos| {
                 if xref_pos <= buffer.len() {
@@ -1629,6 +1769,93 @@ startxref
 
     let strict = Document::load_mem_with_options(
         doc.as_bytes(),
+        LoadOptions {
+            strict: true,
+            ..Default::default()
+        },
+    );
+    assert!(strict.is_err());
+}
+
+#[cfg(all(test, not(feature = "async")))]
+#[test]
+fn accepts_xref_before_distant_trailing_data() {
+    let header = "%PDF-1.5\n";
+    let obj1 = "1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n";
+    let obj2 = "2 0 obj<</Type/Pages/Kids[]/Count 0>>endobj\n";
+    let o1 = header.len();
+    let o2 = o1 + obj1.len();
+    let body = format!("{header}{obj1}{obj2}");
+    let xref_pos = body.len();
+    let mut doc = format!(
+        "{body}xref
+0 3
+0000000000 65535 f
+{o1:010} 00000 n
+{o2:010} 00000 n
+trailer
+<</Root 1 0 R/Size 3>>
+startxref
+{xref_pos}
+%%EOF"
+    )
+    .into_bytes();
+    doc.extend(std::iter::repeat_n(0, 4096));
+
+    let loaded = Document::load_mem(&doc).unwrap();
+    assert_eq!(loaded.xref_start, xref_pos);
+}
+
+#[cfg(all(test, not(feature = "async")))]
+#[test]
+fn recovers_from_zero_startxref_offset() {
+    let header = "%PDF-1.5\n";
+    let obj1 = "1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n";
+    let obj2 = "2 0 obj<</Type/Pages/Kids[]/Count 0>>endobj\n";
+    let o1 = header.len();
+    let o2 = o1 + obj1.len();
+    let body = format!("{header}{obj1}{obj2}");
+    let xref_pos = body.len();
+    let doc = format!(
+        "{body}xref
+0 3
+0000000000 65535 f
+{o1:010} 00000 n
+{o2:010} 00000 n
+trailer
+<</Root 1 0 R/Size 3>>
+startxref
+0
+%%EOF"
+    );
+
+    let loaded = Document::load_mem(doc.as_bytes()).unwrap();
+    assert_eq!(loaded.xref_start, xref_pos);
+
+    let strict = Document::load_mem_with_options(
+        doc.as_bytes(),
+        LoadOptions {
+            strict: true,
+            ..Default::default()
+        },
+    );
+    assert!(strict.is_err());
+}
+
+#[cfg(all(test, not(feature = "async")))]
+#[test]
+fn recovers_objects_when_xref_and_trailer_are_missing() {
+    let doc = b"%PDF-1.5
+1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj
+2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj
+3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]>>endobj
+";
+
+    let loaded = Document::load_mem(doc).unwrap();
+    assert_eq!(loaded.get_pages().len(), 1);
+
+    let strict = Document::load_mem_with_options(
+        doc,
         LoadOptions {
             strict: true,
             ..Default::default()

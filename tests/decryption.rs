@@ -1602,3 +1602,24 @@ fn test_was_encrypted_method() {
         "encryption_state not set when auth failed"
     );
 }
+
+#[test]
+fn recognizes_direct_encryption_dictionary() {
+    let mut document = Document::new();
+    let mut encryption = lopdf::Dictionary::new();
+    encryption.set("Filter", "Standard");
+    encryption.set("V", 4);
+    encryption.set("R", 4);
+    document.trailer.set("Encrypt", encryption);
+
+    assert!(document.is_encrypted());
+    assert_eq!(
+        document
+            .get_encrypted()
+            .unwrap()
+            .get(b"Filter")
+            .and_then(Object::as_name)
+            .unwrap(),
+        b"Standard"
+    );
+}
