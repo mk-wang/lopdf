@@ -116,8 +116,9 @@ pub enum ImageCompressionPolicy {
     /// and uses only lossless recompression.
     #[default]
     Conservative,
-    /// May downsample images and convert lossless grayscale or color images to
-    /// JPEG for additional size reduction.
+    /// May downsample images, convert lossless grayscale or color images to
+    /// JPEG, and convert ICCBased CMYK images to sRGB for additional size
+    /// reduction.
     Aggressive,
 }
 
@@ -156,6 +157,10 @@ pub struct ImageOptimizationOptions {
     pub color_lossless: ImageClassOptions,
     pub resize_filter: ImageResizeFilter,
     pub recompress_only_if_smaller: bool,
+    /// Converts valid ICCBased CMYK images to sRGB before JPEG encoding.
+    ///
+    /// Disabled by default to preserve print-oriented CMYK/ICC semantics.
+    pub convert_icc_cmyk_to_srgb: bool,
     pub max_decoded_image_bytes: usize,
     pub max_decoded_content_bytes: usize,
 }
@@ -184,6 +189,7 @@ impl ImageOptimizationOptions {
             color_lossless: ImageClassOptions::aggressive_jpeg(150.0),
             resize_filter: ImageResizeFilter::Lanczos3,
             recompress_only_if_smaller: true,
+            convert_icc_cmyk_to_srgb: true,
             max_decoded_image_bytes: 512 * 1024 * 1024,
             max_decoded_content_bytes: 64 * 1024 * 1024,
         }
@@ -220,6 +226,7 @@ impl Default for ImageOptimizationOptions {
             },
             resize_filter: ImageResizeFilter::Lanczos3,
             recompress_only_if_smaller: true,
+            convert_icc_cmyk_to_srgb: false,
             max_decoded_image_bytes: 512 * 1024 * 1024,
             max_decoded_content_bytes: 64 * 1024 * 1024,
         }
@@ -1480,8 +1487,9 @@ mod images {
         if pixels.dimensions() != (width, height) {
             return Err(ImageSkipReason::InvalidDimensions);
         }
-        let attempt_icc_conversion =
-            uses_jpeg_recompression(class_options.recompression, lossy) && color.icc_profile.is_some();
+        let attempt_icc_conversion = options.convert_icc_cmyk_to_srgb
+            && uses_jpeg_recompression(class_options.recompression, lossy)
+            && color.icc_profile.is_some();
         // jpeg-decoder already normalizes Adobe CMYK/YCCK samples. The
         // conventional inverted PDF Decode array compensates decoders that
         // expose the stored JPEG components and must not be applied twice

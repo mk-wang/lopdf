@@ -5,7 +5,8 @@ use image::{ExtendedColorType, RgbImage};
 use jpeg_decoder::{Decoder as JpegDecoder, PixelFormat};
 use jpeg_encoder::ColorType as JpegColorType;
 use lopdf::{
-    Dictionary, Document, ImageCompressionPolicy, Object, OptimizeOptions, Stream, content::Content, dictionary,
+    Dictionary, Document, ImageCompressionPolicy, ImageRecompression, Object, OptimizeOptions, Stream,
+    content::Content, dictionary,
 };
 use std::io::Cursor;
 
@@ -451,6 +452,67 @@ fn aggressive_image_policy_rewrites_jpx_while_conservative_preserves_it() {
     );
     assert!(image.content.len() < original.len());
 }
+#[test]
+fn icc_cmyk_conversion_requires_explicit_opt_in() {
+    let (mut document, image_id) = image_document(&[72.0], false);
+    let profile_id = document.add_object(Stream::new(
+        dictionary! {
+            "N" => 4,
+            "Alternate" => "DeviceCMYK",
+            "Filter" => "FlateDecode",
+        },
+        include_bytes!("fixtures/generic-cmyk.icc.zlib").to_vec(),
+    ));
+    let mut image = cmyk_image_stream();
+    image.dict.set(
+        "Decode",
+        vec![
+            1.into(),
+            0.into(),
+            1.into(),
+            0.into(),
+            1.into(),
+            0.into(),
+            1.into(),
+            0.into(),
+        ],
+    );
+    image.dict.set(
+        "ColorSpace",
+        vec![Object::Name(b"ICCBased".to_vec()), profile_id.into()],
+    );
+    *document.get_object_mut(image_id).unwrap() = image.into();
+
+    let mut options = OptimizeOptions::only_images(ImageCompressionPolicy::Conservative);
+    let image_options = options.images.as_mut().unwrap();
+    image_options.color_lossy.recompression = ImageRecompression::Jpeg { quality: 70 };
+    image_options.recompress_only_if_smaller = false;
+    let report = document.optimize(&options).unwrap();
+
+    assert_eq!(report.images.rewritten_images, 1);
+    assert_eq!(report.images.resized_images, 0);
+    let image = document.get_object(image_id).unwrap().as_stream().unwrap();
+    assert_eq!(
+        image
+            .dict
+            .get(b"ColorSpace")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .first()
+            .and_then(|value| value.as_name().ok())
+            .unwrap(),
+        b"ICCBased"
+    );
+    assert!(document.get_object(profile_id).is_ok());
+
+    let mut decoder = JpegDecoder::new(Cursor::new(&image.content));
+    let decoded = decoder.decode().unwrap();
+    let info = decoder.info().unwrap();
+    assert_eq!(info.pixel_format, PixelFormat::CMYK32);
+    assert_eq!(decoded.len(), 600 * 600 * 4);
+}
+
 #[test]
 fn aggressive_image_policy_converts_valid_iccbased_cmyk_jpegs_to_srgb() {
     let (mut document, image_id) = image_document(&[72.0], false);

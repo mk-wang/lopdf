@@ -42,7 +42,7 @@ fn single_stage_constructors_do_not_enable_other_stages() {
 }
 
 #[test]
-fn only_aggressive_image_policy_allows_lossless_color_to_become_jpeg() {
+fn only_aggressive_image_policy_allows_lossy_color_changes() {
     let conservative = OptimizeOptions::only_images(ImageCompressionPolicy::Conservative)
         .images
         .unwrap();
@@ -53,9 +53,11 @@ fn only_aggressive_image_policy_allows_lossless_color_to_become_jpeg() {
     assert_eq!(conservative.color_lossless.subsample_above_dpi, None);
     assert_eq!(conservative.color_lossless.recompression, ImageRecompression::Flate);
     assert_eq!(conservative.color_lossy.recompression, ImageRecompression::Never);
+    assert!(!conservative.convert_icc_cmyk_to_srgb);
     assert!(aggressive.color_lossless.subsample_above_dpi.is_some());
     assert!(matches!(
         aggressive.color_lossless.recompression,
         ImageRecompression::Jpeg { .. }
     ));
+    assert!(aggressive.convert_icc_cmyk_to_srgb);
 }
