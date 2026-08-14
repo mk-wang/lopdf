@@ -4,7 +4,9 @@ use image::codecs::jpeg::JpegEncoder;
 use image::{ExtendedColorType, RgbImage};
 use jpeg_decoder::{Decoder as JpegDecoder, PixelFormat};
 use jpeg_encoder::ColorType as JpegColorType;
-use lopdf::{Dictionary, Document, Object, OptimizeOptions, Stream, content::Content, dictionary};
+use lopdf::{
+    Dictionary, Document, ImageCompressionPolicy, Object, OptimizeOptions, Stream, content::Content, dictionary,
+};
 use std::io::Cursor;
 
 #[test]
@@ -202,10 +204,86 @@ fn content_optimization_minifies_type3_charprocs() {
 }
 
 #[test]
+fn conservative_image_policy_avoids_lossy_reencoding_and_preserves_lossless_dimensions() {
+    let (mut lossy_document, lossy_image_id) = image_document(&[72.0], false);
+    let original_jpeg = lossy_document
+        .get_object(lossy_image_id)
+        .unwrap()
+        .as_stream()
+        .unwrap()
+        .content
+        .clone();
+
+    let lossy_report = lossy_document
+        .optimize(&OptimizeOptions::only_images(ImageCompressionPolicy::Conservative))
+        .unwrap();
+
+    assert_eq!(lossy_report.images.rewritten_images, 0);
+    assert_eq!(
+        lossy_document
+            .get_object(lossy_image_id)
+            .unwrap()
+            .as_stream()
+            .unwrap()
+            .content,
+        original_jpeg
+    );
+
+    let (mut conservative_document, conservative_image_id) = image_document(&[72.0], false);
+    *conservative_document.get_object_mut(conservative_image_id).unwrap() = lossless_rgb_image_stream().into();
+
+    let conservative_report = conservative_document
+        .optimize(&OptimizeOptions::only_images(ImageCompressionPolicy::Conservative))
+        .unwrap();
+    let conservative_image = conservative_document
+        .get_object(conservative_image_id)
+        .unwrap()
+        .as_stream()
+        .unwrap();
+
+    assert_eq!(conservative_report.images.rewritten_images, 1);
+    assert_eq!(conservative_report.images.resized_images, 0);
+    assert_eq!(
+        conservative_image.dict.get(b"Width").and_then(Object::as_i64).unwrap(),
+        600
+    );
+    assert_eq!(
+        conservative_image
+            .dict
+            .get(b"Filter")
+            .and_then(Object::as_name)
+            .unwrap(),
+        b"FlateDecode"
+    );
+
+    let (mut aggressive_document, aggressive_image_id) = image_document(&[72.0], false);
+    *aggressive_document.get_object_mut(aggressive_image_id).unwrap() = lossless_rgb_image_stream().into();
+
+    let aggressive_report = aggressive_document
+        .optimize(&OptimizeOptions::only_images(ImageCompressionPolicy::Aggressive))
+        .unwrap();
+    let aggressive_image = aggressive_document
+        .get_object(aggressive_image_id)
+        .unwrap()
+        .as_stream()
+        .unwrap();
+
+    assert_eq!(aggressive_report.images.rewritten_images, 1);
+    assert_eq!(aggressive_report.images.resized_images, 1);
+    assert_eq!(
+        aggressive_image.dict.get(b"Width").and_then(Object::as_i64).unwrap(),
+        150
+    );
+    assert_eq!(
+        aggressive_image.dict.get(b"Filter").and_then(Object::as_name).unwrap(),
+        b"DCTDecode"
+    );
+}
+
+#[test]
 fn image_optimization_follows_nested_form_ctms() {
     let (mut document, image_id) = image_document(&[72.0], true);
-    let mut options = OptimizeOptions::maximum_compression();
-    options.renumber_objects = false;
+    let options = OptimizeOptions::only_images(ImageCompressionPolicy::Aggressive);
 
     let report = document.optimize(&options).unwrap();
 
@@ -224,8 +302,7 @@ fn image_optimization_follows_nested_form_ctms() {
 #[test]
 fn shared_image_keeps_resolution_needed_by_its_largest_use() {
     let (mut document, image_id) = image_document(&[72.0, 720.0], false);
-    let mut options = OptimizeOptions::maximum_compression();
-    options.renumber_objects = false;
+    let options = OptimizeOptions::only_images(ImageCompressionPolicy::Aggressive);
 
     let report = document.optimize(&options).unwrap();
 
@@ -261,8 +338,7 @@ fn image_in_annotation_appearance_protects_resize() {
         .unwrap()
         .set("Annots", vec![annotation_id.into()]);
 
-    let mut options = OptimizeOptions::maximum_compression();
-    options.renumber_objects = false;
+    let options = OptimizeOptions::only_images(ImageCompressionPolicy::Aggressive);
     let report = document.optimize(&options).unwrap();
 
     assert_eq!(report.images.rewritten_images, 1);
@@ -296,8 +372,7 @@ fn image_optimization_rewrites_ascii85_wrapped_jpegs() {
     );
     image.set_content(ascii85_encode(&jpeg));
 
-    let mut options = OptimizeOptions::maximum_compression();
-    options.renumber_objects = false;
+    let options = OptimizeOptions::only_images(ImageCompressionPolicy::Aggressive);
     let report = document.optimize(&options).unwrap();
 
     assert_eq!(report.images.rewritten_images, 1);
@@ -309,7 +384,7 @@ fn image_optimization_rewrites_ascii85_wrapped_jpegs() {
     assert_eq!(&image.content[..2], &[0xff, 0xd8]);
 }
 #[test]
-fn image_mode_rewrites_iccbased_cmyk_jpegs_as_cmyk() {
+fn aggressive_image_policy_rewrites_iccbased_cmyk_jpegs_as_cmyk() {
     let (mut document, image_id) = image_document(&[72.0], false);
     let profile_id = document.add_object(Stream::new(
         dictionary! {
@@ -338,15 +413,14 @@ fn image_mode_rewrites_iccbased_cmyk_jpegs_as_cmyk() {
     );
     *document.get_object_mut(image_id).unwrap() = image.into();
 
-    let mut options = OptimizeOptions::image();
-    options.renumber_objects = false;
+    let options = OptimizeOptions::only_images(ImageCompressionPolicy::Aggressive);
     let report = document.optimize(&options).unwrap();
 
     assert_eq!(report.images.rewritten_images, 1);
     assert_eq!(report.images.resized_images, 1);
     let image = document.get_object(image_id).unwrap().as_stream().unwrap();
-    assert_eq!(image.dict.get(b"Width").and_then(Object::as_i64).unwrap(), 120);
-    assert_eq!(image.dict.get(b"Height").and_then(Object::as_i64).unwrap(), 120);
+    assert_eq!(image.dict.get(b"Width").and_then(Object::as_i64).unwrap(), 150);
+    assert_eq!(image.dict.get(b"Height").and_then(Object::as_i64).unwrap(), 150);
     assert!(!image.dict.has(b"Decode"));
     assert_eq!(
         image
@@ -365,7 +439,7 @@ fn image_mode_rewrites_iccbased_cmyk_jpegs_as_cmyk() {
     let decoded = decoder.decode().unwrap();
     let info = decoder.info().unwrap();
     assert_eq!(info.pixel_format, PixelFormat::CMYK32);
-    assert_eq!(decoded.len(), 120 * 120 * 4);
+    assert_eq!(decoded.len(), 150 * 150 * 4);
 }
 
 #[test]
@@ -389,8 +463,7 @@ fn image_optimization_preserves_base_images_and_their_soft_masks() {
         .unwrap()
         .dict
         .set("SMask", mask_id);
-    let mut options = OptimizeOptions::maximum_compression();
-    options.renumber_objects = false;
+    let options = OptimizeOptions::only_images(ImageCompressionPolicy::Aggressive);
 
     let report = document.optimize(&options).unwrap();
 
@@ -570,6 +643,28 @@ fn jpeg_image_stream() -> Stream {
         jpeg,
     )
 }
+
+fn lossless_rgb_image_stream() -> Stream {
+    let image = RgbImage::from_fn(600, 600, |x, y| {
+        image::Rgb([
+            (x % 256) as u8,
+            (y % 256) as u8,
+            ((x.wrapping_mul(17) + y.wrapping_mul(31)) % 256) as u8,
+        ])
+    });
+    Stream::new(
+        dictionary! {
+            "Type" => "XObject",
+            "Subtype" => "Image",
+            "Width" => 600,
+            "Height" => 600,
+            "ColorSpace" => "DeviceRGB",
+            "BitsPerComponent" => 8,
+        },
+        image.into_raw(),
+    )
+}
+
 fn cmyk_image_stream() -> Stream {
     let mut pixels = Vec::with_capacity(600 * 600 * 4);
     for y in 0..600_u32 {

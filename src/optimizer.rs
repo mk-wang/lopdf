@@ -7,6 +7,11 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 const MAX_OPTIMIZER_DEPTH: usize = 128;
 const MAX_OPTIMIZED_CONTENT_BYTES: usize = 64 * 1024 * 1024;
 
+/// Selects the optimizer stages and their detailed policies.
+///
+/// `Default` is structural optimization only, equivalent to
+/// [`OptimizeOptions::only_structure`]. Use the named constructors when the
+/// intended stage selection should be explicit.
 #[derive(Debug, Clone)]
 pub struct OptimizeOptions {
     pub prune_unused_objects: bool,
@@ -18,42 +23,50 @@ pub struct OptimizeOptions {
 }
 
 impl OptimizeOptions {
-    /// MuPDF-style image optimization: lossy color and grayscale images above
-    /// 180 DPI are bicubic-resampled to 120 DPI and JPEG-encoded at quality 65.
-    pub fn image() -> Self {
+    /// Enables every optimization stage.
+    ///
+    /// Font subsetting is always part of full-document optimization. The image
+    /// policy controls only whether image rewriting may trade visual fidelity
+    /// for additional size reduction. Requires the `font_subsetting` and
+    /// `embed_image` crate features.
+    pub fn all(image_policy: ImageCompressionPolicy) -> Self {
         Self {
-            // This profile is intentionally image-only.  In particular, do not
-            // let the availability of the font-subsetting feature make an
-            // image optimization call mutate embedded fonts as a side effect.
-            fonts: None,
-            images: Some(ImageOptimizationOptions::image()),
+            fonts: Some(FontOptimizationOptions::default()),
+            images: Some(ImageOptimizationOptions::for_policy(image_policy)),
             ..Self::default()
         }
     }
 
-    pub fn maximum_compression() -> Self {
+    /// Enables only structural optimization.
+    pub fn only_structure() -> Self {
+        Self::default()
+    }
+
+    /// Enables only font subsetting. Requires the `font_subsetting` crate
+    /// feature.
+    pub fn only_fonts() -> Self {
         Self {
-            fonts: {
-                #[cfg(feature = "font_subsetting")]
-                {
-                    Some(FontOptimizationOptions::default())
-                }
-                #[cfg(not(feature = "font_subsetting"))]
-                {
-                    None
-                }
-            },
-            images: {
-                #[cfg(feature = "embed_image")]
-                {
-                    Some(ImageOptimizationOptions::maximum_compression())
-                }
-                #[cfg(not(feature = "embed_image"))]
-                {
-                    None
-                }
-            },
-            ..Self::default()
+            fonts: Some(FontOptimizationOptions::default()),
+            ..Self::disabled()
+        }
+    }
+
+    /// Enables only image rewriting. Requires the `embed_image` crate feature.
+    pub fn only_images(image_policy: ImageCompressionPolicy) -> Self {
+        Self {
+            images: Some(ImageOptimizationOptions::for_policy(image_policy)),
+            ..Self::disabled()
+        }
+    }
+
+    fn disabled() -> Self {
+        Self {
+            prune_unused_objects: false,
+            deduplicate_objects: false,
+            renumber_objects: false,
+            compress_streams: false,
+            fonts: None,
+            images: None,
         }
     }
 }
@@ -96,6 +109,18 @@ pub enum ImageRecompression {
     Jpeg { quality: u8 },
 }
 
+/// Controls whether image optimization may sacrifice visual fidelity.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ImageCompressionPolicy {
+    /// Keeps the original dimensions, leaves existing lossy images untouched,
+    /// and uses only lossless recompression.
+    #[default]
+    Conservative,
+    /// May downsample images and convert lossless grayscale or color images to
+    /// JPEG for additional size reduction.
+    Aggressive,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct ImageClassOptions {
     pub subsample_above_dpi: Option<f32>,
@@ -104,19 +129,11 @@ pub struct ImageClassOptions {
 }
 
 impl ImageClassOptions {
-    fn maximum_jpeg(target_dpi: f32) -> Self {
+    fn aggressive_jpeg(target_dpi: f32) -> Self {
         Self {
             subsample_above_dpi: Some(target_dpi * 1.5),
             subsample_to_dpi: target_dpi,
             recompression: ImageRecompression::Jpeg { quality: 70 },
-        }
-    }
-
-    fn mupdf_lossy_jpeg() -> Self {
-        Self {
-            subsample_above_dpi: Some(180.0),
-            subsample_to_dpi: 120.0,
-            recompression: ImageRecompression::Jpeg { quality: 65 },
         }
     }
 }
@@ -144,44 +161,27 @@ pub struct ImageOptimizationOptions {
 }
 
 impl ImageOptimizationOptions {
-    /// Image settings matching the MuPDF image rewrite profile.
-    pub fn image() -> Self {
-        Self {
-            bitonal: ImageClassOptions {
-                subsample_above_dpi: None,
-                subsample_to_dpi: 120.0,
-                recompression: ImageRecompression::Never,
-            },
-            grayscale_lossy: ImageClassOptions::mupdf_lossy_jpeg(),
-            grayscale_lossless: ImageClassOptions {
-                subsample_above_dpi: None,
-                subsample_to_dpi: 120.0,
-                recompression: ImageRecompression::Never,
-            },
-            color_lossy: ImageClassOptions::mupdf_lossy_jpeg(),
-            color_lossless: ImageClassOptions {
-                subsample_above_dpi: None,
-                subsample_to_dpi: 120.0,
-                recompression: ImageRecompression::Never,
-            },
-            resize_filter: ImageResizeFilter::CatmullRom,
-            recompress_only_if_smaller: true,
-            max_decoded_image_bytes: 512 * 1024 * 1024,
-            max_decoded_content_bytes: 64 * 1024 * 1024,
+    /// Creates image options for the requested visual-fidelity policy.
+    pub fn for_policy(policy: ImageCompressionPolicy) -> Self {
+        match policy {
+            ImageCompressionPolicy::Conservative => Self::default(),
+            ImageCompressionPolicy::Aggressive => Self::aggressive(),
         }
     }
 
-    pub fn maximum_compression() -> Self {
+    /// Allows downsampling and lossy JPEG conversion for additional size
+    /// reduction.
+    pub fn aggressive() -> Self {
         Self {
             bitonal: ImageClassOptions {
                 subsample_above_dpi: Some(450.0),
                 subsample_to_dpi: 300.0,
                 recompression: ImageRecompression::Flate,
             },
-            grayscale_lossy: ImageClassOptions::maximum_jpeg(200.0),
-            grayscale_lossless: ImageClassOptions::maximum_jpeg(200.0),
-            color_lossy: ImageClassOptions::maximum_jpeg(150.0),
-            color_lossless: ImageClassOptions::maximum_jpeg(150.0),
+            grayscale_lossy: ImageClassOptions::aggressive_jpeg(200.0),
+            grayscale_lossless: ImageClassOptions::aggressive_jpeg(200.0),
+            color_lossy: ImageClassOptions::aggressive_jpeg(150.0),
+            color_lossless: ImageClassOptions::aggressive_jpeg(150.0),
             resize_filter: ImageResizeFilter::Lanczos3,
             recompress_only_if_smaller: true,
             max_decoded_image_bytes: 512 * 1024 * 1024,
@@ -196,12 +196,12 @@ impl Default for ImageOptimizationOptions {
             bitonal: ImageClassOptions {
                 subsample_above_dpi: None,
                 subsample_to_dpi: 300.0,
-                recompression: ImageRecompression::Preserve { jpeg_quality: 85 },
+                recompression: ImageRecompression::Flate,
             },
             grayscale_lossy: ImageClassOptions {
                 subsample_above_dpi: None,
                 subsample_to_dpi: 200.0,
-                recompression: ImageRecompression::Preserve { jpeg_quality: 85 },
+                recompression: ImageRecompression::Never,
             },
             grayscale_lossless: ImageClassOptions {
                 subsample_above_dpi: None,
@@ -211,7 +211,7 @@ impl Default for ImageOptimizationOptions {
             color_lossy: ImageClassOptions {
                 subsample_above_dpi: None,
                 subsample_to_dpi: 150.0,
-                recompression: ImageRecompression::Preserve { jpeg_quality: 85 },
+                recompression: ImageRecompression::Never,
             },
             color_lossless: ImageClassOptions {
                 subsample_above_dpi: None,

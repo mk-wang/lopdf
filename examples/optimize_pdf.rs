@@ -1,4 +1,4 @@
-use lopdf::{Document, LoadOptions, OptimizeOptions, SaveOptions};
+use lopdf::{Document, ImageCompressionPolicy, LoadOptions, OptimizeOptions, SaveOptions};
 use std::error::Error;
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -47,7 +47,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let started = Instant::now();
     let mut document = load_document(&input)?;
     let page_count = document.get_pages().len();
-    let report = document.optimize(&OptimizeOptions::maximum_compression())?;
+    let report = document.optimize(&OptimizeOptions::all(ImageCompressionPolicy::Conservative))?;
 
     let mut output_file = File::create(&output)?;
     let save_options = SaveOptions::builder()

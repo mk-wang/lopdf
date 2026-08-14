@@ -1,8 +1,6 @@
 #![cfg(feature = "font_subsetting")]
 
-use lopdf::{
-    Dictionary, Document, FontOptimizationOptions, Object, OptimizeOptions, Stream, content::Content, dictionary,
-};
+use lopdf::{Dictionary, Document, Object, OptimizeOptions, Stream, content::Content, dictionary};
 
 #[test]
 fn subsets_identity_cid_font_without_rewriting_character_codes() {
@@ -84,11 +82,7 @@ fn assert_subsets_identity_cid_font(font_data: Vec<u8>) {
     });
     document.trailer.set("Root", catalog_id);
 
-    let options = OptimizeOptions {
-        fonts: Some(FontOptimizationOptions::default()),
-        renumber_objects: false,
-        ..OptimizeOptions::default()
-    };
+    let options = OptimizeOptions::only_fonts();
     let report = document.optimize(&options).unwrap();
 
     assert_eq!(report.fonts.total_fonts, 1);
@@ -186,14 +180,8 @@ fn subsets_name_keyed_cff_without_rewriting_character_codes() {
     });
     document.trailer.set("Root", catalog_id);
 
-    let options = OptimizeOptions {
-        fonts: Some(FontOptimizationOptions {
-            subset_only_if_smaller: false,
-            ..FontOptimizationOptions::default()
-        }),
-        renumber_objects: false,
-        ..OptimizeOptions::default()
-    };
+    let mut options = OptimizeOptions::only_fonts();
+    options.fonts.as_mut().unwrap().subset_only_if_smaller = false;
     let report = document.optimize(&options).unwrap();
 
     assert_eq!(report.fonts.total_fonts, 1);

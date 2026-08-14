@@ -51,9 +51,9 @@ pub use incremental_document::IncrementalDocument;
 pub use load_options::{FilterFunc, LoadOptions};
 pub use object_stream::{ObjectStream, ObjectStreamBuilder, ObjectStreamConfig};
 pub use optimizer::{
-    FontOptimizationOptions, FontOptimizationReport, FontSkipReason, ImageClassOptions, ImageOptimizationOptions,
-    ImageOptimizationReport, ImageRecompression, ImageResizeFilter, ImageSkipReason, OptimizeOptions, OptimizeReport,
-    StructureOptimizationReport,
+    FontOptimizationOptions, FontOptimizationReport, FontSkipReason, ImageClassOptions, ImageCompressionPolicy,
+    ImageOptimizationOptions, ImageOptimizationReport, ImageRecompression, ImageResizeFilter, ImageSkipReason,
+    OptimizeOptions, OptimizeReport, StructureOptimizationReport,
 };
 pub use outlines::Outline;
 pub use reader::{PdfMetadata, Reader};

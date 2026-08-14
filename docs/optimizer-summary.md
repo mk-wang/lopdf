@@ -47,22 +47,37 @@
 
 ## API 与 Feature
 
-最大压缩配置：
+完整压缩通常使用保守图片策略：结构压缩和字体子集化始终启用；图片不降采样，不重编码已有 JPEG，也不会从无损编码转为有损编码：
 
 ```rust
-let report = document.optimize(&lopdf::OptimizeOptions::maximum_compression())?;
+let report = document.optimize(&lopdf::OptimizeOptions::all(
+    lopdf::ImageCompressionPolicy::Conservative,
+))?;
 ```
 
-图片模式（MuPDF 风格：高于 180 DPI 时降到 120 DPI，JPEG 质量 65；仅结果更小时替换）：
+只有明确接受潜在画质损失时，才选择激进图片策略；它允许降采样并把无损灰度图和彩色图转为 JPEG：
 
 ```rust
-let report = document.optimize(&lopdf::OptimizeOptions::image())?;
+let report = document.optimize(&lopdf::OptimizeOptions::all(
+    lopdf::ImageCompressionPolicy::Aggressive,
+))?;
+```
+
+处理范围和图片压缩强度是两个正交选择。调用方也可以只运行一种优化：
+
+```rust
+let report = document.optimize(&lopdf::OptimizeOptions::only_fonts())?;
+let report = document.optimize(&lopdf::OptimizeOptions::only_images(
+    lopdf::ImageCompressionPolicy::Conservative,
+))?;
+let report = document.optimize(&lopdf::OptimizeOptions::only_structure())?;
 ```
 
 Feature：
 
 - `embed_image`：图片解码、重采样和 JPEG/Flate 重编码
-- `font_subsetting`：TrueType CID 字体子集化
+- `font_subsetting`：TrueType CID 与 CFF/OpenType 字体子集化
+- `OptimizeOptions::all(...)` 同时请求两项能力，因此需要同时启用上述两个 feature；缺少时会在修改文档前返回错误
 
 报告类型：
 
