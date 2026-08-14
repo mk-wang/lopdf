@@ -131,7 +131,7 @@ pub struct ImageClassOptions {
 impl ImageClassOptions {
     fn aggressive_jpeg(target_dpi: f32) -> Self {
         Self {
-            subsample_above_dpi: Some(target_dpi * 1.5),
+            subsample_above_dpi: Some(target_dpi),
             subsample_to_dpi: target_dpi,
             recompression: ImageRecompression::Jpeg { quality: 70 },
         }
@@ -697,12 +697,17 @@ fn dictionaries_equal(left: &Dictionary, right: &Dictionary, depth: usize, strea
 mod images {
     use super::*;
     use crate::content::Content;
+    use hayro_jpeg2000::{ColorSpace as JpxColorSpace, DecodeSettings as JpxDecodeSettings, Image as JpxImage};
     use image::imageops::FilterType;
     use image::{GrayImage, RgbImage, RgbaImage};
     use jpeg_decoder::{Decoder as JpegDecoder, PixelFormat};
-    use jpeg_encoder::{ColorType as JpegColorType, Encoder as JpegEncoder, SamplingFactor};
+    use jpeg_encoder::{ColorType as JpegColorType, Encoder as JpegEncoder};
+    use moxcms::{ColorProfile, DataColorSpace, Layout, RenderingIntent, Transform8BitExecutor, TransformOptions};
     use std::borrow::Cow;
     use std::io::Cursor;
+    use std::sync::Arc;
+
+    const MAX_ICC_PROFILE_BYTES: usize = 16 * 1024 * 1024;
 
     #[derive(Debug, Clone, Copy, Default)]
     struct ImageUsage {
@@ -807,6 +812,8 @@ mod images {
                 content_streams_skipped: analysis.skipped_content_streams,
                 ..ImageOptimizationReport::default()
             };
+            let mut icc_transforms = IccTransformCache::default();
+            let mut obsolete_color_objects = HashSet::new();
 
             for id in image_ids {
                 let Some(Object::Stream(original)) = self.objects.get(&id) else {
@@ -823,7 +830,7 @@ mod images {
                 // displayed at a larger size. Recompression remains safe,
                 // but resizing must fail closed for the whole document.
                 let allow_resize = analysis.skipped_content_streams == 0;
-                match rewrite_image(self, original, usage, options, allow_resize) {
+                match rewrite_image(self, original, usage, options, allow_resize, &mut icc_transforms) {
                     Ok(rewrite) => {
                         let old_len = original.content.len();
                         let new_len = rewrite.stream.content.len();
@@ -836,6 +843,7 @@ mod images {
                         report.resized_images += usize::from(rewrite.resized);
                         report.optimized_stream_bytes += new_len;
                         report.image_bytes_saved += old_len.saturating_sub(new_len);
+                        obsolete_color_objects.extend(rewrite.obsolete_color_objects);
                         self.objects.insert(id, Object::Stream(rewrite.stream));
                     }
                     Err(reason) => {
@@ -844,6 +852,7 @@ mod images {
                     }
                 }
             }
+            remove_unreferenced_color_objects(self, &obsolete_color_objects);
             Ok(report)
         }
     }
@@ -1331,6 +1340,45 @@ mod images {
         Rgb,
         Cmyk,
     }
+    #[derive(Debug)]
+    struct ColorInfo {
+        model: ColorModel,
+        icc_profile: Option<IccProfile>,
+    }
+
+    #[derive(Debug)]
+    struct IccProfile {
+        content: Vec<u8>,
+        object_ids: Vec<ObjectId>,
+    }
+
+    #[derive(Default)]
+    struct IccTransformCache {
+        transforms: HashMap<([u8; 32], RenderingIntent), Option<Arc<Transform8BitExecutor>>>,
+    }
+
+    impl IccTransformCache {
+        fn transform(&mut self, profile: &[u8], intent: RenderingIntent) -> Option<Arc<Transform8BitExecutor>> {
+            let digest: [u8; 32] = Sha256::digest(profile).into();
+            self.transforms
+                .entry((digest, intent))
+                .or_insert_with(|| {
+                    let source = ColorProfile::new_from_slice(profile).ok()?;
+                    if source.color_space != DataColorSpace::Cmyk {
+                        return None;
+                    }
+                    let destination = ColorProfile::new_srgb();
+                    let options = TransformOptions {
+                        rendering_intent: intent,
+                        ..TransformOptions::default()
+                    };
+                    source
+                        .create_transform_8bit(Layout::Rgba, &destination, Layout::Rgb, options)
+                        .ok()
+                })
+                .clone()
+        }
+    }
 
     #[derive(Debug)]
     enum Pixels {
@@ -1366,18 +1414,20 @@ mod images {
     struct ImageRewrite {
         stream: Stream,
         resized: bool,
+        obsolete_color_objects: Vec<ObjectId>,
     }
 
     fn rewrite_image(
         document: &Document, original: &Stream, usage: ImageUsage, options: &ImageOptimizationOptions,
-        allow_resize: bool,
+        allow_resize: bool, icc_transforms: &mut IccTransformCache,
     ) -> std::result::Result<ImageRewrite, ImageSkipReason> {
         if original.dict.has(b"SMask") || original.dict.has(b"Mask") {
             return Err(ImageSkipReason::Masked);
         }
         let width = positive_dimension(&original.dict, b"Width").ok_or(ImageSkipReason::InvalidDimensions)?;
         let height = positive_dimension(&original.dict, b"Height").ok_or(ImageSkipReason::InvalidDimensions)?;
-        let model = color_model(document, &original.dict)?;
+        let color = color_info(document, &original.dict, options.max_decoded_image_bytes)?;
+        let model = color.model;
         let bits = original
             .dict
             .get(b"BitsPerComponent")
@@ -1395,6 +1445,18 @@ mod images {
             .ok_or(ImageSkipReason::UnsupportedBitsPerComponent)?;
         if !matches!(bits, 1 | 8) {
             return Err(ImageSkipReason::UnsupportedBitsPerComponent);
+        }
+        let lossy = has_filter(original, b"DCTDecode") || has_filter(original, b"JPXDecode");
+        let class_options = match (model, bits, lossy) {
+            (ColorModel::Gray, 1, _) => options.bitonal,
+            (ColorModel::Gray, 8, true) => options.grayscale_lossy,
+            (ColorModel::Gray, 8, false) => options.grayscale_lossless,
+            (ColorModel::Rgb | ColorModel::Cmyk, 8, true) => options.color_lossy,
+            (ColorModel::Rgb | ColorModel::Cmyk, 8, false) => options.color_lossless,
+            _ => return Err(ImageSkipReason::UnsupportedBitsPerComponent),
+        };
+        if class_options.recompression == ImageRecompression::Never {
+            return Err(ImageSkipReason::PolicyDisabled);
         }
         let channels = match model {
             ColorModel::Gray => 1,
@@ -1414,22 +1476,45 @@ mod images {
             return Err(ImageSkipReason::DecodeLimitExceeded);
         }
 
-        let lossy = has_filter(original, b"DCTDecode");
         let mut pixels = decode_pixels(original, model, bits, options.max_decoded_image_bytes)?;
         if pixels.dimensions() != (width, height) {
             return Err(ImageSkipReason::InvalidDimensions);
         }
-        apply_decode(&original.dict, &mut pixels)?;
-        let class_options = match (&pixels, lossy) {
-            (Pixels::Bitonal(_), _) => options.bitonal,
-            (Pixels::Gray(_), true) => options.grayscale_lossy,
-            (Pixels::Gray(_), false) => options.grayscale_lossless,
-            (Pixels::Rgb(_), true) | (Pixels::Cmyk(_), true) => options.color_lossy,
-            (Pixels::Rgb(_), false) | (Pixels::Cmyk(_), false) => options.color_lossless,
-        };
-        if class_options.recompression == ImageRecompression::Never {
-            return Err(ImageSkipReason::PolicyDisabled);
+        let attempt_icc_conversion =
+            uses_jpeg_recompression(class_options.recompression, lossy) && color.icc_profile.is_some();
+        // jpeg-decoder already normalizes Adobe CMYK/YCCK samples. The
+        // conventional inverted PDF Decode array compensates decoders that
+        // expose the stored JPEG components and must not be applied twice
+        // before an ICC transform.
+        let defer_decode =
+            attempt_icc_conversion && has_filter(original, b"DCTDecode") && has_inverted_cmyk_decode(&original.dict);
+        if !defer_decode {
+            apply_decode(&original.dict, &mut pixels)?;
         }
+        let converted = if attempt_icc_conversion {
+            match (&pixels, color.icc_profile.as_ref()) {
+                (Pixels::Cmyk(image), Some(profile)) => convert_icc_cmyk_to_srgb(
+                    image,
+                    &profile.content,
+                    image_rendering_intent(&original.dict),
+                    icc_transforms,
+                ),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let mut obsolete_color_objects = Vec::new();
+        let converted_to_srgb = if let Some(rgb) = converted {
+            pixels = Pixels::Rgb(rgb);
+            obsolete_color_objects = color.icc_profile.unwrap().object_ids;
+            true
+        } else {
+            if defer_decode {
+                apply_decode(&original.dict, &mut pixels)?;
+            }
+            false
+        };
 
         let mut resized = false;
         if allow_resize
@@ -1447,53 +1532,194 @@ mod images {
             }
         }
 
-        let stream = encode_pixels(original, pixels, class_options.recompression, lossy)?;
-        Ok(ImageRewrite { stream, resized })
+        let stream = encode_pixels(original, pixels, class_options.recompression, lossy, converted_to_srgb)?;
+        Ok(ImageRewrite {
+            stream,
+            resized,
+            obsolete_color_objects,
+        })
     }
 
-    fn color_model(document: &Document, dictionary: &Dictionary) -> std::result::Result<ColorModel, ImageSkipReason> {
+    fn color_info(
+        document: &Document, dictionary: &Dictionary, max_profile_bytes: usize,
+    ) -> std::result::Result<ColorInfo, ImageSkipReason> {
         if dictionary
             .get(b"ImageMask")
             .and_then(Object::as_bool)
             .ok()
             .unwrap_or(false)
         {
-            return Ok(ColorModel::Gray);
+            return Ok(ColorInfo {
+                model: ColorModel::Gray,
+                icc_profile: None,
+            });
         }
-        let value = dictionary
+        let color_space = dictionary
             .get(b"ColorSpace")
             .map_err(|_| ImageSkipReason::UnsupportedColorSpace)?;
         let (_, value) = document
-            .dereference(value)
+            .dereference(color_space)
             .map_err(|_| ImageSkipReason::UnsupportedColorSpace)?;
+        let plain = |model| {
+            Ok(ColorInfo {
+                model,
+                icc_profile: None,
+            })
+        };
         match value {
-            Object::Name(name) if matches!(name.as_slice(), b"DeviceGray" | b"G" | b"CalGray") => Ok(ColorModel::Gray),
-            Object::Name(name) if matches!(name.as_slice(), b"DeviceRGB" | b"RGB" | b"CalRGB") => Ok(ColorModel::Rgb),
-            Object::Name(name) if name.as_slice() == b"DeviceCMYK" => Ok(ColorModel::Cmyk),
+            Object::Name(name) if matches!(name.as_slice(), b"DeviceGray" | b"G" | b"CalGray") => {
+                plain(ColorModel::Gray)
+            }
+            Object::Name(name) if matches!(name.as_slice(), b"DeviceRGB" | b"RGB" | b"CalRGB") => {
+                plain(ColorModel::Rgb)
+            }
+            Object::Name(name) if name.as_slice() == b"DeviceCMYK" => plain(ColorModel::Cmyk),
             Object::Array(values) => match values.first().and_then(|value| value.as_name().ok()) {
-                Some(b"CalGray") => Ok(ColorModel::Gray),
-                Some(b"CalRGB") => Ok(ColorModel::Rgb),
+                Some(b"CalGray") => plain(ColorModel::Gray),
+                Some(b"CalRGB") => plain(ColorModel::Rgb),
                 Some(b"ICCBased") => {
                     let profile = values.get(1).ok_or(ImageSkipReason::UnsupportedColorSpace)?;
                     let (_, profile) = document
                         .dereference(profile)
                         .map_err(|_| ImageSkipReason::UnsupportedColorSpace)?;
-                    match profile
+                    let profile = profile
                         .as_stream()
-                        .ok()
-                        .and_then(|stream| stream.dict.get(b"N").ok())
-                        .and_then(|value| value.as_i64().ok())
+                        .map_err(|_| ImageSkipReason::UnsupportedColorSpace)?;
+                    let model = match profile
+                        .dict
+                        .get(b"N")
+                        .and_then(Object::as_i64)
+                        .map_err(|_| ImageSkipReason::UnsupportedColorSpace)?
                     {
-                        Some(1) => Ok(ColorModel::Gray),
-                        Some(3) => Ok(ColorModel::Rgb),
-                        Some(4) => Ok(ColorModel::Cmyk),
-                        _ => Err(ImageSkipReason::UnsupportedColorSpace),
-                    }
+                        1 => ColorModel::Gray,
+                        3 => ColorModel::Rgb,
+                        4 => ColorModel::Cmyk,
+                        _ => return Err(ImageSkipReason::UnsupportedColorSpace),
+                    };
+                    let icc_profile = if model == ColorModel::Cmyk {
+                        profile
+                            .decompressed_content_with_limit(max_profile_bytes.min(MAX_ICC_PROFILE_BYTES))
+                            .ok()
+                            .map(|content| IccProfile {
+                                content,
+                                object_ids: color_object_ids(document, color_space),
+                            })
+                    } else {
+                        None
+                    };
+                    Ok(ColorInfo { model, icc_profile })
                 }
                 _ => Err(ImageSkipReason::UnsupportedColorSpace),
             },
             _ => Err(ImageSkipReason::UnsupportedColorSpace),
         }
+    }
+
+    fn color_object_ids(document: &Document, color_space: &Object) -> Vec<ObjectId> {
+        let mut pending = Vec::new();
+        collect_direct_references(color_space, &mut pending, 0);
+        let mut ids = HashSet::new();
+        while let Some(id) = pending.pop() {
+            if !ids.insert(id) {
+                continue;
+            }
+            if let Some(object) = document.objects.get(&id) {
+                collect_direct_references(object, &mut pending, 0);
+            }
+        }
+        let mut ids: Vec<_> = ids.into_iter().collect();
+        ids.sort_unstable();
+        ids
+    }
+    fn collect_direct_references(object: &Object, references: &mut Vec<ObjectId>, depth: usize) {
+        if depth >= MAX_OPTIMIZER_DEPTH {
+            return;
+        }
+        match object {
+            Object::Reference(id) => references.push(*id),
+            Object::Array(values) => {
+                for value in values {
+                    collect_direct_references(value, references, depth + 1);
+                }
+            }
+            Object::Dictionary(dictionary) => {
+                for (_, value) in dictionary {
+                    collect_direct_references(value, references, depth + 1);
+                }
+            }
+            Object::Stream(stream) => {
+                for (_, value) in &stream.dict {
+                    collect_direct_references(value, references, depth + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn remove_unreferenced_color_objects(document: &mut Document, candidates: &HashSet<ObjectId>) {
+        if candidates.is_empty() {
+            return;
+        }
+        let mut pending = Vec::new();
+        for (id, object) in &document.objects {
+            if !candidates.contains(id) {
+                collect_direct_references(object, &mut pending, 0);
+            }
+        }
+        for (_, value) in &document.trailer {
+            collect_direct_references(value, &mut pending, 0);
+        }
+
+        let mut reachable = HashSet::new();
+        while let Some(id) = pending.pop() {
+            if !candidates.contains(&id) || !reachable.insert(id) {
+                continue;
+            }
+            if let Some(object) = document.objects.get(&id) {
+                collect_direct_references(object, &mut pending, 0);
+            }
+        }
+        document
+            .objects
+            .retain(|id, _| !candidates.contains(id) || reachable.contains(id));
+    }
+
+    fn uses_jpeg_recompression(recompression: ImageRecompression, source_lossy: bool) -> bool {
+        matches!(recompression, ImageRecompression::Jpeg { .. })
+            || source_lossy && matches!(recompression, ImageRecompression::Preserve { .. })
+    }
+    fn has_inverted_cmyk_decode(dictionary: &Dictionary) -> bool {
+        dictionary
+            .get(b"Decode")
+            .and_then(Object::as_array)
+            .ok()
+            .is_some_and(|values| {
+                values.len() == 8
+                    && values
+                        .chunks_exact(2)
+                        .all(|pair| pair[0].as_float().ok() == Some(1.0) && pair[1].as_float().ok() == Some(0.0))
+            })
+    }
+
+    fn image_rendering_intent(dictionary: &Dictionary) -> RenderingIntent {
+        match dictionary.get(b"Intent").and_then(Object::as_name).ok() {
+            Some(b"AbsoluteColorimetric") => RenderingIntent::AbsoluteColorimetric,
+            Some(b"Perceptual") => RenderingIntent::Perceptual,
+            Some(b"Saturation") => RenderingIntent::Saturation,
+            _ => RenderingIntent::RelativeColorimetric,
+        }
+    }
+
+    fn convert_icc_cmyk_to_srgb(
+        image: &RgbaImage, profile: &[u8], intent: RenderingIntent, transforms: &mut IccTransformCache,
+    ) -> Option<RgbImage> {
+        let transform = transforms.transform(profile, intent)?;
+        let pixel_count = usize::try_from(image.width())
+            .ok()?
+            .checked_mul(usize::try_from(image.height()).ok()?)?;
+        let mut output = vec![0; pixel_count.checked_mul(3)?];
+        transform.transform(image.as_raw(), &mut output).ok()?;
+        RgbImage::from_raw(image.width(), image.height(), output)
     }
 
     fn filters(stream: &Stream) -> Vec<&[u8]> {
@@ -1518,6 +1744,15 @@ mod images {
             }
             let jpeg = jpeg_content(stream, &stream_filters, max_bytes)?;
             return decode_jpeg_pixels(&jpeg, model, width, height, max_bytes);
+        }
+        let jpx_filters = stream_filters == [b"JPXDecode".as_slice()]
+            || stream_filters == [b"ASCII85Decode".as_slice(), b"JPXDecode".as_slice()];
+        if jpx_filters {
+            if bits != 8 {
+                return Err(ImageSkipReason::UnsupportedBitsPerComponent);
+            }
+            let jpx = jpx_content(stream, &stream_filters, max_bytes)?;
+            return decode_jpx_pixels(&jpx, model, width, height, max_bytes);
         }
         if stream_filters.iter().any(|filter| {
             !matches!(
@@ -1622,6 +1857,47 @@ mod images {
             _ => Err(ImageSkipReason::DecodeFailed),
         }
     }
+    fn decode_jpx_pixels(
+        jpx: &[u8], model: ColorModel, width: u32, height: u32, max_bytes: usize,
+    ) -> std::result::Result<Pixels, ImageSkipReason> {
+        let image = JpxImage::new(jpx, &JpxDecodeSettings::default()).map_err(|_| ImageSkipReason::DecodeFailed)?;
+        if image.width() != width || image.height() != height {
+            return Err(ImageSkipReason::InvalidDimensions);
+        }
+        if image.has_alpha() {
+            return Err(ImageSkipReason::Masked);
+        }
+        let expected_channels = match model {
+            ColorModel::Gray => 1,
+            ColorModel::Rgb => 3,
+            ColorModel::Cmyk => 4,
+        };
+        let color_space_matches = match (model, image.color_space()) {
+            (ColorModel::Gray, JpxColorSpace::Gray)
+            | (ColorModel::Rgb, JpxColorSpace::RGB)
+            | (ColorModel::Cmyk, JpxColorSpace::CMYK) => true,
+            (_, JpxColorSpace::Icc { num_channels, .. }) => usize::from(*num_channels) == expected_channels,
+            _ => false,
+        };
+        if !color_space_matches {
+            return Err(ImageSkipReason::UnsupportedColorSpace);
+        }
+        let decoded = image.decode().map_err(|_| ImageSkipReason::DecodeFailed)?;
+        if decoded.len() > max_bytes {
+            return Err(ImageSkipReason::DecodeLimitExceeded);
+        }
+        match model {
+            ColorModel::Gray => GrayImage::from_raw(width, height, decoded)
+                .map(Pixels::Gray)
+                .ok_or(ImageSkipReason::DecodeFailed),
+            ColorModel::Rgb => RgbImage::from_raw(width, height, decoded)
+                .map(Pixels::Rgb)
+                .ok_or(ImageSkipReason::DecodeFailed),
+            ColorModel::Cmyk => RgbaImage::from_raw(width, height, decoded)
+                .map(Pixels::Cmyk)
+                .ok_or(ImageSkipReason::DecodeFailed),
+        }
+    }
 
     fn jpeg_content<'a>(
         stream: &'a Stream, stream_filters: &[&[u8]], max_bytes: usize,
@@ -1630,6 +1906,23 @@ mod images {
             return Ok(Cow::Borrowed(stream.content.as_slice()));
         }
         if stream_filters == [b"ASCII85Decode".as_slice(), b"DCTDecode".as_slice()] {
+            let mut ascii85 = stream.clone();
+            ascii85.dict.set("Filter", "ASCII85Decode");
+            ascii85.dict.remove(b"DecodeParms");
+            return ascii85
+                .decompressed_content_with_limit(max_bytes)
+                .map(Cow::Owned)
+                .map_err(image_decode_error);
+        }
+        Err(ImageSkipReason::UnsupportedFilter)
+    }
+    fn jpx_content<'a>(
+        stream: &'a Stream, stream_filters: &[&[u8]], max_bytes: usize,
+    ) -> std::result::Result<Cow<'a, [u8]>, ImageSkipReason> {
+        if stream_filters == [b"JPXDecode".as_slice()] {
+            return Ok(Cow::Borrowed(stream.content.as_slice()));
+        }
+        if stream_filters == [b"ASCII85Decode".as_slice(), b"JPXDecode".as_slice()] {
             let mut ascii85 = stream.clone();
             ascii85.dict.set("Filter", "ASCII85Decode");
             ascii85.dict.remove(b"DecodeParms");
@@ -1652,6 +1945,7 @@ mod images {
 
     fn encode_pixels(
         original: &Stream, pixels: Pixels, recompression: ImageRecompression, source_lossy: bool,
+        converted_to_srgb: bool,
     ) -> std::result::Result<Stream, ImageSkipReason> {
         let effective = match recompression {
             ImageRecompression::Preserve { jpeg_quality } if source_lossy => {
@@ -1667,6 +1961,9 @@ mod images {
         dictionary.remove(b"Decode");
         dictionary.remove(b"DecodeParms");
         dictionary.remove(b"Filter");
+        if converted_to_srgb {
+            dictionary.set("ColorSpace", "DeviceRGB");
+        }
         match effective {
             ImageRecompression::Never | ImageRecompression::Preserve { .. } => Err(ImageSkipReason::PolicyDisabled),
             ImageRecompression::Jpeg { quality } => {
@@ -1682,7 +1979,6 @@ mod images {
                 let width = u16::try_from(width).map_err(|_| ImageSkipReason::InvalidDimensions)?;
                 let height = u16::try_from(height).map_err(|_| ImageSkipReason::InvalidDimensions)?;
                 let mut encoder = JpegEncoder::new(&mut encoded, quality.clamp(1, 100));
-                encoder.set_sampling_factor(SamplingFactor::R_4_4_4);
                 encoder.set_optimized_huffman_tables(true);
                 match pixels {
                     Pixels::Bitonal(image) | Pixels::Gray(image) => encoder
@@ -1692,7 +1988,7 @@ mod images {
                         .encode(image.as_raw(), width, height, JpegColorType::Rgb)
                         .map_err(|_| ImageSkipReason::DecodeFailed)?,
                     Pixels::Cmyk(image) => encoder
-                        .encode(image.as_raw(), width, height, JpegColorType::Cmyk)
+                        .encode(image.as_raw(), width, height, JpegColorType::CmykAsYcck)
                         .map_err(|_| ImageSkipReason::DecodeFailed)?,
                 }
                 dictionary.set("BitsPerComponent", 8);

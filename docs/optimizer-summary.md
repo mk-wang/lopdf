@@ -100,7 +100,7 @@ Feature：
 | content clean | 页面、Form、Pattern、soft mask、annotation AP、Type3；最小空白 | 页面、所有 Form、tiling Pattern、Type3；严格解析、64 MiB 上限、Inline Image 跳过 | 本次补齐 Type3 与最短 string |
 | content sanitize | 平衡 q/Q、删除重复 graphics-state/color 操作、重建已用 Resources | 未实现 | 高价值但语义面大；需独立 graphics-state processor |
 | font subset | simple/CID TrueType、CFF/OpenType、非 Identity CMap；同字体程序先去重 | Type0 + Identity-H/V + CIDFontType2 + FontFile2 | 继续保守；下一优先级为 simple TrueType |
-| image rewrite | JPEG/JPX/Flate/Fax；灰/彩/二值；可色彩转换；Inline Image | JPEG/Flate/LZW/ASCII；灰/彩/二值；DeviceCMYK 与 4 通道 ICCBased；共享 DPI/嵌套 Form；mask/JPX/Inline 跳过 | 已覆盖常见安全子集 |
+| image rewrite | JPEG/JPX/Flate/Fax；灰/彩/二值；可色彩转换；Inline Image | JPEG/JPX/Flate/LZW/ASCII；灰/彩/二值；DeviceCMYK 保持 CMYK/YCCK；有效 4 通道 ICCBased 按 profile 转 sRGB；共享 DPI/嵌套 Form；mask/Inline 跳过 | 已覆盖常见安全子集 |
 | page select/vectorize/appearance/encryption | 工具级附加能力 | 非优化器职责或已有独立 API | 不纳入压缩优化器 |
 
 优先级结论：
@@ -114,19 +114,20 @@ Feature：
 
 已支持安全重写：
 
-- JPEG、Flate、LZW、ASCII85、ASCIIHex、RunLength 图片流
+- JPEG、JPX/JPEG 2000、Flate、LZW、ASCII85、ASCIIHex、RunLength 图片流
 - DeviceGray、DeviceRGB、DeviceCMYK、CalGray、CalRGB
-- 1 通道、3 通道或 4 通道 ICCBased 色彩空间
+- 1 通道、3 通道 ICCBased；有效 4 通道 ICCBased 在激进 JPEG 路径中按嵌入 profile 和 rendering intent 转换为 sRGB
 - 嵌套 Form、继承 Resources、CTM、UserUnit、Pattern、soft mask 中的图片使用分析
 - 同一 Image XObject 多处复用时，按最低实际 DPI 决定是否降采样
 - 仅在结果更小时替换图片流
 
 当前保守跳过：
 
-- JPX/JPEG 2000
+- 带 alpha、色彩空间不匹配或无法解码的 JPX/JPEG 2000
 - DeviceN、Separation 和不支持的 ICC 色彩空间
 - 带 `Mask`/`SMask` 的 base image 及其 mask image
 - 不支持的 filter、位深、尺寸或解码失败的图片
+- 4 通道 ICC profile 无效或无法建立转换时不伪造 RGB，保留原 ICCBased CMYK/YCCK 路径
 
 所有跳过均通过 `ImageSkipReason` 计数，不伪造优化成功。
 
@@ -210,8 +211,9 @@ Release 构建，使用 `/usr/bin/time -l`：
 - 文本/矢量 PDF：41,443 B vs MuPDF 42,754 B；144 DPI **0 differing pixels**；文本字节一致。
 - 用户 `1.pdf`：41,378 B vs MuPDF 42,188 B；150 DPI **0 differing pixels**；文本字节一致。
 - 扫描 PDF：658,358 B vs MuPDF 740,561 B；72 DPI MAE `275.457 (0.0042032)`；同参数 MuPDF MAE `415.051 (0.00633327)`。
+- CMYK ICC 样本 D05：188,906 B → 9,506 B；150 DPI 渲染每通道 MAE `1.294/0.380/0.519`（满量程 255）；MuPDF 为 48,695 B，但该样本色彩渲染错误。
 
-此前 POC 的 6 个风险样本也已覆盖 JPEG XObject、JPX、soft mask、alpha、CMYK ICC、共享 Image XObject；不支持的表示保持原对象。
+此前 POC 的 6 个风险样本也已覆盖 JPEG XObject、JPX、soft mask、alpha、CMYK ICC、共享 Image XObject；激进策略可将无 alpha 的受支持 JPX 解码后重写为 JPEG，mask/alpha 与其他不支持的表示保持原对象。
 ## 验证命令
 
 ```bash
@@ -227,8 +229,8 @@ cargo clippy --all-features --lib --example optimize_pdf --test optimizer --test
 - content sanitize：graphics-state 平衡、重复状态操作删除、已用 Resources 重建
 - simple TrueType、非 Identity Type0/CID 映射、CFF/OpenType 子集化
 - font-program digest 去重
-- JPX/JPEG 2000、CCITT/JBIG2 重编码
-- CMYK/DeviceN 到 RGB 的色彩管理转换
+- JPX/JPEG 2000 输出编码、CCITT/JBIG2 重编码
+- 没有有效 ICC profile 的 DeviceCMYK，以及 DeviceN/Separation 到 RGB 的可靠色彩转换
 - 带 mask 图片与 Inline Image 的安全重写
 
 这些能力应继续保持“解码、转换、渲染验证、失败即保留”的策略，不能通过强制转换来换取表面文件缩减。

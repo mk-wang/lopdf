@@ -281,6 +281,21 @@ fn conservative_image_policy_avoids_lossy_reencoding_and_preserves_lossless_dime
 }
 
 #[test]
+fn aggressive_image_policy_downsamples_to_its_configured_target_dpi() {
+    let (mut document, image_id) = image_document(&[216.0], false);
+
+    let report = document
+        .optimize(&OptimizeOptions::only_images(ImageCompressionPolicy::Aggressive))
+        .unwrap();
+
+    assert_eq!(report.images.rewritten_images, 1);
+    assert_eq!(report.images.resized_images, 1);
+    let image = document.get_object(image_id).unwrap().as_stream().unwrap();
+    assert_eq!(image.dict.get(b"Width").and_then(Object::as_i64).unwrap(), 450);
+    assert_eq!(image.dict.get(b"Height").and_then(Object::as_i64).unwrap(), 450);
+}
+
+#[test]
 fn image_optimization_follows_nested_form_ctms() {
     let (mut document, image_id) = image_document(&[72.0], true);
     let options = OptimizeOptions::only_images(ImageCompressionPolicy::Aggressive);
@@ -383,8 +398,117 @@ fn image_optimization_rewrites_ascii85_wrapped_jpegs() {
     );
     assert_eq!(&image.content[..2], &[0xff, 0xd8]);
 }
+
 #[test]
-fn aggressive_image_policy_rewrites_iccbased_cmyk_jpegs_as_cmyk() {
+fn aggressive_image_policy_rewrites_jpx_while_conservative_preserves_it() {
+    let (mut conservative, conservative_image_id) = image_document(&[72.0], false);
+    *conservative.get_object_mut(conservative_image_id).unwrap() = jpx_image_stream().into();
+    let original = conservative
+        .get_object(conservative_image_id)
+        .unwrap()
+        .as_stream()
+        .unwrap()
+        .content
+        .clone();
+
+    let conservative_report = conservative
+        .optimize(&OptimizeOptions::only_images(ImageCompressionPolicy::Conservative))
+        .unwrap();
+
+    assert_eq!(conservative_report.images.rewritten_images, 0);
+    assert_eq!(
+        conservative_report
+            .images
+            .skips
+            .get(&lopdf::ImageSkipReason::PolicyDisabled),
+        Some(&1)
+    );
+    assert_eq!(
+        conservative
+            .get_object(conservative_image_id)
+            .unwrap()
+            .as_stream()
+            .unwrap()
+            .content,
+        original
+    );
+
+    let (mut aggressive, aggressive_image_id) = image_document(&[72.0], false);
+    *aggressive.get_object_mut(aggressive_image_id).unwrap() = jpx_image_stream().into();
+
+    let aggressive_report = aggressive
+        .optimize(&OptimizeOptions::only_images(ImageCompressionPolicy::Aggressive))
+        .unwrap();
+
+    assert_eq!(aggressive_report.images.rewritten_images, 1);
+    assert_eq!(aggressive_report.images.resized_images, 1);
+    let image = aggressive.get_object(aggressive_image_id).unwrap().as_stream().unwrap();
+    assert_eq!(image.dict.get(b"Width").and_then(Object::as_i64).unwrap(), 200);
+    assert_eq!(image.dict.get(b"Height").and_then(Object::as_i64).unwrap(), 150);
+    assert_eq!(
+        image.dict.get(b"Filter").and_then(Object::as_name).unwrap(),
+        b"DCTDecode"
+    );
+    assert!(image.content.len() < original.len());
+}
+#[test]
+fn aggressive_image_policy_converts_valid_iccbased_cmyk_jpegs_to_srgb() {
+    let (mut document, image_id) = image_document(&[72.0], false);
+    let profile_id = document.add_object(Stream::new(
+        dictionary! {
+            "N" => 4,
+            "Alternate" => "DeviceCMYK",
+            "Filter" => "FlateDecode",
+        },
+        include_bytes!("fixtures/generic-cmyk.icc.zlib").to_vec(),
+    ));
+    let color_space_id = document.add_object(Object::Array(vec![
+        Object::Name(b"ICCBased".to_vec()),
+        profile_id.into(),
+    ]));
+    let mut image = cmyk_image_stream();
+    image.dict.set(
+        "Decode",
+        vec![
+            1.into(),
+            0.into(),
+            1.into(),
+            0.into(),
+            1.into(),
+            0.into(),
+            1.into(),
+            0.into(),
+        ],
+    );
+    image.dict.set("ColorSpace", color_space_id);
+    *document.get_object_mut(image_id).unwrap() = image.into();
+
+    let report = document
+        .optimize(&OptimizeOptions::only_images(ImageCompressionPolicy::Aggressive))
+        .unwrap();
+
+    assert_eq!(report.images.rewritten_images, 1);
+    assert_eq!(report.images.resized_images, 1);
+    let image = document.get_object(image_id).unwrap().as_stream().unwrap();
+    assert_eq!(image.dict.get(b"Width").and_then(Object::as_i64).unwrap(), 150);
+    assert_eq!(image.dict.get(b"Height").and_then(Object::as_i64).unwrap(), 150);
+    assert!(!image.dict.has(b"Decode"));
+    assert_eq!(
+        image.dict.get(b"ColorSpace").and_then(Object::as_name).unwrap(),
+        b"DeviceRGB"
+    );
+
+    let mut decoder = JpegDecoder::new(Cursor::new(&image.content));
+    let decoded = decoder.decode().unwrap();
+    let info = decoder.info().unwrap();
+    assert_eq!(info.pixel_format, PixelFormat::RGB24);
+    assert_eq!(decoded.len(), 150 * 150 * 3);
+    assert!(document.get_object(color_space_id).is_err());
+    assert!(document.get_object(profile_id).is_err());
+}
+
+#[test]
+fn aggressive_image_policy_preserves_cmyk_when_icc_profile_is_invalid() {
     let (mut document, image_id) = image_document(&[72.0], false);
     let profile_id = document.add_object(Stream::new(
         dictionary! {
@@ -641,6 +765,21 @@ fn jpeg_image_stream() -> Stream {
             "Filter" => "DCTDecode",
         },
         jpeg,
+    )
+}
+
+fn jpx_image_stream() -> Stream {
+    Stream::new(
+        dictionary! {
+            "Type" => "XObject",
+            "Subtype" => "Image",
+            "Width" => 400,
+            "Height" => 300,
+            "ColorSpace" => "DeviceRGB",
+            "BitsPerComponent" => 8,
+            "Filter" => "JPXDecode",
+        },
+        include_bytes!("fixtures/jpx-rgb.jp2").to_vec(),
     )
 }
 

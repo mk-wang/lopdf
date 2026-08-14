@@ -28,8 +28,14 @@ ecb = "0.2"
 encoding_rs = "0.8"
 flate2 = "1.1"
 image = { version = "0.25", optional = true }
+hayro-jpeg2000 = { version = "0.3", optional = true, default-features = false, features = [
+    "std",
+] }
 jpeg-decoder = { version = "0.3", optional = true }
 jpeg-encoder = { version = "0.7", optional = true }
+moxcms = { version = "0.8.1", optional = true, default-features = false, features = [
+    "lut",
+] }
 indexmap = "2.14"
 itoa = "1.0"
 jiff = { version = "0.2", optional = true }
@@ -73,7 +79,13 @@ chrono = ["dep:chrono"]
 # The system-local conversions, and the iana-time-zone subtree they need.
 chrono-clock = ["chrono", "chrono/clock"]
 default = ["chrono-clock", "rayon"]
-embed_image = ["image", "dep:jpeg-decoder", "dep:jpeg-encoder"]
+embed_image = [
+    "image",
+    "dep:hayro-jpeg2000",
+    "dep:jpeg-decoder",
+    "dep:jpeg-encoder",
+    "dep:moxcms",
+]
 font_embedding = ["dep:skrifa"]
 font_subsetting = ["dep:subsetter"]
 jiff = ["dep:jiff"]
