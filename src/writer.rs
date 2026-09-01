@@ -48,7 +48,7 @@ impl Document {
             }
         }
 
-        if options.use_object_streams {
+        if use_object_streams {
             self.save_with_object_streams(target, options)
         } else {
             self.save_internal(target)

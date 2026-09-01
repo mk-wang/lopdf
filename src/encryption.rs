@@ -6,6 +6,7 @@ mod rc4;
 use crate::{Dictionary, Document, Error, Object, ObjectId};
 use bitflags::bitflags;
 use crypt_filters::*;
+use rand::RngExt as _;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use thiserror::Error;
@@ -477,6 +478,101 @@ impl TryFrom<EncryptionVersion<'_>> for EncryptionState {
 }
 
 impl EncryptionState {
+    /// Builds the contract-defined Standard Security Handler AES-128 revision 4 state from
+    /// opaque password bytes.
+    ///
+    /// Unlike [`EncryptionVersion::V4`], this preserves the password byte sequences exactly:
+    /// it neither interprets them as UTF-8 nor applies PDFDocEncoding conversion.
+    pub fn aes128_r4_raw(
+        document: &mut Document,
+        owner_password: &[u8],
+        user_password: &[u8],
+    ) -> Result<Self, Error> {
+        ensure_encryption_file_identifier(document);
+        let permissions = Permissions::all().correct_bits();
+        let mut algorithm = PasswordAlgorithm {
+            encrypt_metadata: true,
+            length: Some(128),
+            version: 4,
+            revision: 4,
+            permissions,
+            ..Default::default()
+        };
+
+        algorithm.owner_value =
+            algorithm.compute_hashed_owner_password_r4(Some(owner_password), user_password)?;
+        algorithm.user_value = algorithm.compute_hashed_user_password_r3_r4(document, user_password)?;
+        let file_encryption_key = algorithm.compute_file_encryption_key_r4(document, user_password)?;
+        let crypt_filter: Arc<dyn CryptFilter> = Arc::new(Aes128CryptFilter);
+
+        Ok(Self {
+            version: algorithm.version,
+            revision: algorithm.revision,
+            key_length: algorithm.length,
+            encrypt_metadata: algorithm.encrypt_metadata,
+            crypt_filters: BTreeMap::from([(b"StdCF".to_vec(), crypt_filter)]),
+            file_encryption_key,
+            stream_filter: b"StdCF".to_vec(),
+            string_filter: b"StdCF".to_vec(),
+            owner_value: algorithm.owner_value,
+            user_value: algorithm.user_value,
+            permissions: algorithm.permissions,
+            ..Default::default()
+        })
+    }
+
+    /// Builds the contract-defined Standard Security Handler AES-256 revision 6 state from
+    /// opaque password bytes.
+    ///
+    /// Unlike [`EncryptionVersion::V5`], this preserves the password byte sequences exactly:
+    /// it neither interprets them as UTF-8 nor applies SASLprep.
+    pub fn aes256_r6_raw(owner_password: &[u8], user_password: &[u8]) -> Result<Self, Error> {
+        let permissions = Permissions::all().correct_bits();
+        let mut algorithm = PasswordAlgorithm {
+            encrypt_metadata: true,
+            length: Some(256),
+            version: 5,
+            revision: 6,
+            permissions,
+            ..Default::default()
+        };
+        let mut file_encryption_key = [0_u8; 32];
+        rand::rng().fill(&mut file_encryption_key);
+
+        let result = (|| {
+            let (user_value, user_encrypted) =
+                algorithm.compute_hashed_user_password_r6(file_encryption_key, user_password)?;
+            algorithm.user_value = user_value;
+            algorithm.user_encrypted = user_encrypted;
+            let (owner_value, owner_encrypted) =
+                algorithm.compute_hashed_owner_password_r6(file_encryption_key, owner_password)?;
+            algorithm.owner_value = owner_value;
+            algorithm.owner_encrypted = owner_encrypted;
+            algorithm.permission_encrypted = algorithm.compute_permissions(file_encryption_key)?;
+            let crypt_filter: Arc<dyn CryptFilter> = Arc::new(Aes256CryptFilter);
+
+            Ok(Self {
+                version: algorithm.version,
+                revision: algorithm.revision,
+                key_length: algorithm.length,
+                encrypt_metadata: algorithm.encrypt_metadata,
+                crypt_filters: BTreeMap::from([(b"StdCF".to_vec(), crypt_filter)]),
+                file_encryption_key: file_encryption_key.to_vec(),
+                stream_filter: b"StdCF".to_vec(),
+                string_filter: b"StdCF".to_vec(),
+                owner_value: algorithm.owner_value,
+                owner_encrypted: algorithm.owner_encrypted,
+                user_value: algorithm.user_value,
+                user_encrypted: algorithm.user_encrypted,
+                permissions: algorithm.permissions,
+                permission_encrypted: algorithm.permission_encrypted,
+                encrypt_object_id: None,
+            })
+        })();
+        file_encryption_key.fill(0);
+        result
+    }
+
     pub fn version(&self) -> i64 {
         self.version
     }
@@ -672,6 +768,23 @@ impl EncryptionState {
             .cloned()
             .unwrap_or(Arc::new(Rc4CryptFilter))
     }
+}
+
+fn ensure_encryption_file_identifier(document: &mut Document) {
+    if document.trailer.has(b"ID") {
+        return;
+    }
+
+    let mut identifier = [0_u8; 16];
+    rand::rng().fill(&mut identifier);
+    document.trailer.set(
+        b"ID",
+        Object::Array(vec![
+            Object::string_literal(identifier.to_vec()),
+            Object::string_literal(identifier.to_vec()),
+        ]),
+    );
+    identifier.fill(0);
 }
 
 /// Encrypts `obj`.
@@ -1044,5 +1157,22 @@ mod tests {
 
         assert!(document.encrypt(&state).is_ok());
         assert!(document.decrypt("user").is_ok());
+    }
+
+    #[test]
+    fn raw_aes_security_states_preserve_non_utf8_password_bytes() {
+        let mut document = create_document();
+        let owner_password = b"\xffowner";
+        let user_password = b"\x80user";
+        let state = EncryptionState::aes128_r4_raw(&mut document, owner_password, user_password).unwrap();
+        document.encrypt(&state).unwrap();
+        document.decrypt_raw(user_password).unwrap();
+
+        let mut document = create_document();
+        let owner_password = b"\xffowner";
+        let user_password = b"\x80user";
+        let state = EncryptionState::aes256_r6_raw(owner_password, user_password).unwrap();
+        document.encrypt(&state).unwrap();
+        document.decrypt_raw(user_password).unwrap();
     }
 }

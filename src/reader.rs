@@ -85,6 +85,7 @@ impl Document {
             document: Document::new(),
             encryption_state: None,
             raw_objects: BTreeMap::new(),
+            raw_password: None,
             password: options.password,
             strict: options.strict,
             max_decompressed_size: options.max_decompressed_size,
@@ -104,7 +105,32 @@ impl Document {
             document: Document::new(),
             encryption_state: None,
             raw_objects: BTreeMap::new(),
+            raw_password: None,
             password: options.password,
+            strict: options.strict,
+            max_decompressed_size: options.max_decompressed_size,
+        }
+        .read(options.filter)
+    }
+
+    /// Load an encrypted PDF from memory using opaque password bytes exactly as supplied.
+    pub fn load_mem_with_raw_password(buffer: &[u8], password: &[u8]) -> Result<Document> {
+        Self::load_mem_with_raw_password_and_options(buffer, password, LoadOptions::default())
+    }
+
+    /// Load an encrypted PDF from memory with opaque password bytes and explicit load options.
+    pub fn load_mem_with_raw_password_and_options(
+        buffer: &[u8],
+        password: &[u8],
+        options: LoadOptions,
+    ) -> Result<Document> {
+        Reader {
+            buffer,
+            document: Document::new(),
+            encryption_state: None,
+            raw_objects: BTreeMap::new(),
+            password: None,
+            raw_password: Some(password),
             strict: options.strict,
             max_decompressed_size: options.max_decompressed_size,
         }
@@ -154,6 +180,7 @@ impl Document {
             document: Document::new(),
             encryption_state: None,
             raw_objects: BTreeMap::new(),
+            raw_password: None,
             password: None,
             strict: false,
             max_decompressed_size: None,
@@ -169,6 +196,7 @@ impl Document {
             document: Document::new(),
             encryption_state: None,
             raw_objects: BTreeMap::new(),
+            raw_password: None,
             password: Some(password.to_string()),
             strict: false,
             max_decompressed_size: None,
@@ -187,6 +215,7 @@ impl Document {
             document: Document::new(),
             encryption_state: None,
             raw_objects: BTreeMap::new(),
+            raw_password: None,
             password,
             strict: false,
             max_decompressed_size: None,
@@ -230,6 +259,7 @@ impl Document {
             document: Document::new(),
             encryption_state: None,
             raw_objects: BTreeMap::new(),
+            raw_password: None,
             password: options.password,
             strict: options.strict,
             max_decompressed_size: options.max_decompressed_size,
@@ -249,6 +279,7 @@ impl Document {
             document: Document::new(),
             encryption_state: None,
             raw_objects: BTreeMap::new(),
+            raw_password: None,
             password: options.password,
             strict: options.strict,
             max_decompressed_size: options.max_decompressed_size,
@@ -295,6 +326,7 @@ impl Document {
             document: Document::new(),
             encryption_state: None,
             raw_objects: BTreeMap::new(),
+            raw_password: None,
             password: None,
             strict: false,
             max_decompressed_size: None,
@@ -310,6 +342,7 @@ impl Document {
             document: Document::new(),
             encryption_state: None,
             raw_objects: BTreeMap::new(),
+            raw_password: None,
             password: Some(password.to_string()),
             strict: false,
             max_decompressed_size: None,
@@ -330,6 +363,7 @@ impl Document {
             document: Document::new(),
             encryption_state: None,
             raw_objects: BTreeMap::new(),
+            raw_password: None,
             password,
             strict: false,
             max_decompressed_size: None,
@@ -347,6 +381,7 @@ impl TryInto<Document> for &[u8] {
             document: Document::new(),
             encryption_state: None,
             raw_objects: BTreeMap::new(),
+            raw_password: None,
             password: None,
             strict: false,
             max_decompressed_size: None,
@@ -380,6 +415,7 @@ impl IncrementalDocument {
             document: Document::new(),
             encryption_state: None,
             raw_objects: BTreeMap::new(),
+            raw_password: None,
             password: None,
             strict: false,
             max_decompressed_size: None,
@@ -423,6 +459,7 @@ impl IncrementalDocument {
             document: Document::new(),
             encryption_state: None,
             raw_objects: BTreeMap::new(),
+            raw_password: None,
             password: None,
             strict: false,
             max_decompressed_size: None,
@@ -447,6 +484,7 @@ impl TryInto<IncrementalDocument> for &[u8] {
             document: Document::new(),
             encryption_state: None,
             raw_objects: BTreeMap::new(),
+            raw_password: None,
             password: None,
             strict: false,
             max_decompressed_size: None,
@@ -463,6 +501,7 @@ pub struct Reader<'a> {
     pub encryption_state: Option<EncryptionState>,
     pub raw_objects: BTreeMap<ObjectId, Vec<u8>>, // Store raw bytes for encrypted objects
     pub password: Option<String>,                 // Password for encrypted PDFs
+    pub raw_password: Option<&'a [u8]>,           // Opaque password bytes for encrypted PDFs
     pub strict: bool,                             // Reject non-conforming PDFs when true
     /// Maximum decompressed size, in bytes, allowed for any single stream
     /// (object streams and cross-reference streams) decoded during loading.
@@ -1321,9 +1360,18 @@ impl Reader<'_> {
     }
 
     fn authenticate_and_setup_encryption(&mut self, require_password: bool) -> Result<Option<String>> {
-        let password_to_use: Option<String> = if self.document.authenticate_password("").is_ok() {
-            Some(String::new())
-        } else if let Some(ref pwd) = self.password {
+        if let Some(password) = self.raw_password {
+            if self.document.authenticate_raw_password(password).is_err() {
+                if require_password {
+                    return Err(Error::InvalidPassword);
+                }
+                warn!("Invalid password provided for encrypted PDF");
+                return Err(Error::InvalidPassword);
+            }
+            self.encryption_state = Some(EncryptionState::decode(&self.document, password)?);
+            return Ok(Some(String::new()));
+        }
+        let password_to_use: Option<String> = if let Some(ref pwd) = self.password {
             if self.document.authenticate_password(pwd).is_ok() {
                 Some(pwd.clone())
             } else if require_password {
@@ -1340,7 +1388,6 @@ impl Reader<'_> {
             warn!("PDF is encrypted and requires a password");
             return Ok(None);
         };
-
         if let Some(ref password) = password_to_use {
             let state = EncryptionState::decode(&self.document, password)?;
             self.encryption_state = Some(state);
