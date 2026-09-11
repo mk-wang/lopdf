@@ -317,6 +317,9 @@ pub struct OptimizeReport {
 #[cfg(feature = "font_subsetting")]
 mod fonts;
 
+#[cfg(feature = "embed_image")]
+mod resample;
+
 impl Document {
     pub fn optimize(&mut self, options: &OptimizeOptions) -> Result<OptimizeReport> {
         if self.is_encrypted() {
@@ -1409,6 +1412,15 @@ mod images {
                 Self::Bitonal(image) => {
                     let resized = image::imageops::resize(&image, width, height, FilterType::Nearest);
                     Self::Bitonal(resized)
+                }
+                Self::Gray(image) if filter == FilterType::Lanczos3 => {
+                    Self::Gray(resample::lanczos3(&image, width, height))
+                }
+                Self::Rgb(image) if filter == FilterType::Lanczos3 => {
+                    Self::Rgb(resample::lanczos3(&image, width, height))
+                }
+                Self::Cmyk(image) if filter == FilterType::Lanczos3 => {
+                    Self::Cmyk(resample::lanczos3(&image, width, height))
                 }
                 Self::Gray(image) => Self::Gray(image::imageops::resize(&image, width, height, filter)),
                 Self::Rgb(image) => Self::Rgb(image::imageops::resize(&image, width, height, filter)),

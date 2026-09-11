@@ -1,3 +1,9 @@
+## Unreleased
+
+### Performance
+
+* Stream optimizer Lanczos3 resampling through a single floating-point row instead of a full intermediate image. Preserve sampling and rounding, keep bitonal and other filters unchanged, and cap cached horizontal weights and span metadata at 1 MiB. Images exceeding that cache budget retain the existing scaler rather than repeatedly evaluating kernels per row.
+
 <a name="v0.44.0"></a>
 ## [v0.44.0](https://github.com/J-F-Liu/lopdf/compare/v0.43.0...v0.44.0) (2026-07-10)
 
