@@ -946,35 +946,51 @@ impl Reader<'_> {
     /// filters or object-stream expansion run. A syntactically valid xref can
     /// still point at the wrong object after a damaged incremental update.
     fn repair_xref_if_needed(&mut self) -> Result<()> {
-        let failure = self
-            .document
-            .reference_table
-            .entries
-            .iter()
-            .find_map(|(&number, entry)| {
-                let XrefEntry::Normal { offset, generation } = *entry else {
-                    return None;
-                };
-                let error = if self.strict {
-                    self.read_object(offset as usize, Some((number, generation)), &mut HashSet::new())
-                        .err()
-                } else {
-                    self.validate_object_header(offset as usize, (number, generation)).err()
-                };
-                error.map(|error| (number, error))
-            });
+        let mut failure = None;
+        let mut invalid_offsets = HashSet::new();
+        let mut max_valid_offset = None;
+        for (&number, entry) in &self.document.reference_table.entries {
+            let XrefEntry::Normal { offset, generation } = *entry else {
+                continue;
+            };
+            let error = if self.strict {
+                self.read_object(offset as usize, Some((number, generation)), &mut HashSet::new())
+                    .err()
+            } else {
+                self.validate_object_header(offset as usize, (number, generation)).err()
+            };
+            match error {
+                None => {
+                    max_valid_offset =
+                        Some(max_valid_offset.map_or(offset as usize, |max: usize| max.max(offset as usize)));
+                }
+                Some(error) => {
+                    if self.strict {
+                        return Err(error);
+                    }
+                    if !matches!(error, Error::ObjectIdMismatch) {
+                        invalid_offsets.insert(offset as usize);
+                    }
+                    if failure.is_none() {
+                        failure = Some((number, error));
+                    }
+                }
+            }
+        }
         let Some((number, error)) = failure else {
             return Ok(());
         };
 
-        if self.strict {
-            return Err(error);
+        // Keep an invalid terminal offset as a hard recovery bound, but do not
+        // let invalid offsets in the middle of the file truncate a valid stream
+        // when a later validated xref offset proves where the next object starts.
+        if !matches!(error, Error::ObjectIdMismatch)
+            && let Some(max_valid_offset) = max_valid_offset
+        {
+            self.normal_offsets
+                .retain(|offset| !invalid_offsets.contains(offset) || *offset >= max_valid_offset);
         }
-        // Only an offset that names a *different* object is repaired: the entry is
-        // stale, and rebuilding the table locates the true one. An offset that names
-        // no object at all is left to the loading pass, which drops that one object
-        // (and reports it in strict mode) instead of resurrecting it from an
-        // unrelated copy elsewhere in the file.
+
         if !matches!(error, Error::ObjectIdMismatch) {
             return Ok(());
         }

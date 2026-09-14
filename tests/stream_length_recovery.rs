@@ -304,3 +304,32 @@ fn stream_length_recovery_stops_at_the_next_recorded_xref_offset() {
     assert!(document.get_object((4, 0)).is_err());
     assert!(document.get_object((5, 0)).is_err());
 }
+
+#[test]
+fn malformed_stream_recovers_before_multiple_invalid_middle_xref_offsets() {
+    // Invalid entries in the middle of the file must not truncate a valid
+    // malformed stream when a later validated entry supplies the boundary.
+    let content = vec![b'A'; 48];
+    let objects: Vec<(u32, Vec<u8>)> = vec![
+        (1, catalog().to_vec()),
+        (2, pages("3 0 R")),
+        (3, page("/Im0 4 0 R")),
+        (4, wrong_length_stream_body(&content)),
+        (5, b"<< /Type /Font >>\n".to_vec()),
+        (6, b"<< /Type /Font >>\n".to_vec()),
+        (7, b"<< /Type /Font >>\n".to_vec()),
+    ];
+    let bodies: Vec<(u32, &[u8])> = objects.iter().map(|(id, body)| (*id, body.as_slice())).collect();
+    let (pdf, _) = pdf_from_objects(&bodies, &[]);
+    let stream_start = stream_data_start(&pdf);
+    let (pdf, _) = pdf_from_objects(&bodies, &[(5, stream_start + 16), (6, stream_start + 32)]);
+
+    let document = Document::load_mem(&pdf).unwrap();
+    let Object::Stream(stream) = document.get_object((4, 0)).unwrap() else {
+        panic!("malformed stream should recover before the later valid object");
+    };
+    assert_eq!(stream.content, content);
+    assert!(document.get_object((5, 0)).is_err());
+    assert!(document.get_object((6, 0)).is_err());
+    assert!(document.get_object((7, 0)).is_ok());
+}
