@@ -111,7 +111,7 @@ fn test_metadata_extraction_encrypted_empty_password() {
     let encrypted_path = temp_dir.path().join("test_encrypted_metadata.pdf");
     doc.save(&encrypted_path).unwrap();
 
-    let metadata = Document::load_metadata(&encrypted_path).unwrap();
+    let metadata = Document::load_metadata_with_password(&encrypted_path, "").unwrap();
     assert_eq!(metadata.title, Some("Test Encrypted PDF".to_string()));
     assert_eq!(metadata.author, Some("Test Author".to_string()));
     assert_eq!(metadata.subject, Some("Test Subject".to_string()));

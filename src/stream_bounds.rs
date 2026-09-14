@@ -39,38 +39,9 @@ pub(crate) fn declared_endstream(input: &[u8], content_len: usize) -> Option<usi
         .then_some(end)
 }
 
-/// Locate the first line-delimited `endstream` marker for lenient recovery.
-/// The line ending before the marker is structural and excluded from the
-/// recovered content length.
-pub(crate) fn recovered_stream_end(input: &[u8]) -> Option<(usize, usize)> {
-    input
-        .windows(b"endstream".len())
-        .enumerate()
-        .find_map(|(position, keyword)| {
-            if keyword != b"endstream" || position == 0 {
-                return None;
-            }
-            let content_end = if input.get(position.saturating_sub(2)..position) == Some(b"\r\n") {
-                position - 2
-            } else if input
-                .get(position - 1)
-                .is_some_and(|byte| matches!(*byte, b'\r' | b'\n'))
-            {
-                position - 1
-            } else {
-                return None;
-            };
-            let end = position + b"endstream".len();
-            input
-                .get(end)
-                .is_none_or(|byte| byte.is_ascii_whitespace() || b"()<>[]{}/%".contains(byte))
-                .then_some((content_end, end))
-        })
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{StreamBoundsError, checked_stream_end, declared_endstream, recovered_stream_end};
+    use super::{StreamBoundsError, checked_stream_end, declared_endstream};
 
     #[test]
     fn checks_declared_stream_ranges_without_overflow() {
@@ -84,11 +55,9 @@ mod tests {
     }
 
     #[test]
-    fn recognizes_exact_and_recovered_endstream_boundaries() {
+    fn recognizes_declared_endstream_boundaries() {
         assert_eq!(declared_endstream(b"abc\nendstream", 3), Some(13));
         assert_eq!(declared_endstream(b"abcendstream", 3), Some(12));
         assert_eq!(declared_endstream(b"abc\nnotstream", 3), None);
-        assert_eq!(recovered_stream_end(b"abc\r\nendstream\n"), Some((3, 14)));
-        assert_eq!(recovered_stream_end(b"abc endstream"), None);
     }
 }

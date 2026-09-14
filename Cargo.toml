@@ -13,13 +13,14 @@ license = "MIT"
 name = "lopdf"
 readme = "README.md"
 repository = "https://github.com/J-F-Liu/lopdf.git"
-version = "0.44.0"
+version = "0.45.0"
 rust-version = "1.88"
 exclude = ["/benches", "/assets", "/.chglog", "/.vscode", "/.github"]
 
 [dependencies]
 aes = "0.9"
 bitflags = "2.13"
+brotli-decompressor = "5.0"
 cbc = "0.2"
 chrono = { version = "0.4", optional = true, default-features = false, features = [
     "std",

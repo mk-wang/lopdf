@@ -428,7 +428,7 @@ impl PasswordAlgorithm {
             let mut owner_encrypted = self.owner_encrypted.clone();
             let mut decryptor = Aes256CbcDec::new(&key.into(), &iv.into());
 
-            for block in owner_encrypted.chunks_exact_mut(16) {
+            for block in owner_encrypted.as_chunks_mut::<16>().0 {
                 decryptor.decrypt_block(aes_block_mut(block));
             }
 
@@ -458,7 +458,7 @@ impl PasswordAlgorithm {
             let mut user_encrypted = self.user_encrypted.clone();
             let mut decryptor = Aes256CbcDec::new(&key.into(), &iv.into());
 
-            for block in user_encrypted.chunks_exact_mut(16) {
+            for block in user_encrypted.as_chunks_mut::<16>().0 {
                 decryptor.decrypt_block(aes_block_mut(block));
             }
 
@@ -542,7 +542,7 @@ impl PasswordAlgorithm {
 
             let mut encryptor = Aes128CbcEnc::new(key.into(), iv.into());
 
-            for block in k1.chunks_exact_mut(16) {
+            for block in k1.as_chunks_mut::<16>().0 {
                 encryptor.encrypt_block(aes_block_mut(block));
             }
 
@@ -823,8 +823,33 @@ impl PasswordAlgorithm {
     where
         O: AsRef<[u8]>,
     {
-        // Pad or truncate the owner string. If there is no owner password, use the user password
-        // instead.
+        self.recover_user_password_r4(doc, owner_password).map(|_| ())
+    }
+
+    /// Recover the padded (32-byte) user password from the encryption
+    /// dictionary's `/O` entry, given a candidate owner password — the
+    /// bulk of Algorithm 7 (revision 4 and earlier) — authenticating the
+    /// recovered value against `/U` before returning it.
+    ///
+    /// The owner and user passwords are independent credentials; either is
+    /// sufficient to open the document, but they need not be equal, and
+    /// Algorithm 2 (the file encryption key) is always derived from the
+    /// *user* password. A caller that only checks "does this password
+    /// authenticate" (e.g. [`Self::authenticate_owner_password_r4`]) and
+    /// then reuses the literal input for Algorithm 2 derives the wrong file
+    /// key whenever the caller supplied the owner password and it differs
+    /// from the user password: decryption reports success (dictionaries,
+    /// names, integers and references are never encrypted, so structure
+    /// and page count still resolve correctly), but every decrypted string
+    /// and stream comes out as garbage. This method exists so callers can
+    /// recover and use the correct value instead — see
+    /// [`crate::encryption::PasswordAlgorithm::resolve_password_for_key_derivation`].
+    pub(crate) fn recover_user_password_r4<O>(
+        &self, doc: &Document, owner_password: O,
+    ) -> Result<Vec<u8>, DecryptionError>
+    where
+        O: AsRef<[u8]>,
+    {
         let password = owner_password.as_ref();
 
         // Pad or truncate the resulting password string to exactly 32 bytes. If the password string is
@@ -899,8 +924,10 @@ impl PasswordAlgorithm {
 
         // The result of the previous step purports to be the user password. Authenticate this user
         // password using Algorithm 5. If it is correct, the password supplied is the correct owner
-        // password.
-        self.authenticate_user_password_r4(doc, &result)
+        // password, and `result` — the padded 32-byte recovered user password — is what Algorithm 2
+        // must be given to derive the correct file encryption key.
+        self.authenticate_user_password_r4(doc, &result)?;
+        Ok(result)
     }
 
     /// Compute the encryption dictionary's U-entry value (revision 6).
@@ -959,7 +986,7 @@ impl PasswordAlgorithm {
         let mut user_encrypted = file_encryption_key.to_vec();
         let mut encryptor = Aes256CbcEnc::new(&key.into(), &iv.into());
 
-        for block in user_encrypted.chunks_exact_mut(16) {
+        for block in user_encrypted.as_chunks_mut::<16>().0 {
             encryptor.encrypt_block(aes_block_mut(block));
         }
 
@@ -1013,7 +1040,7 @@ impl PasswordAlgorithm {
         let mut owner_encrypted = file_encryption_key.to_vec();
         let mut encryptor = Aes256CbcEnc::new(&key.into(), &iv.into());
 
-        for block in owner_encrypted.chunks_exact_mut(16) {
+        for block in owner_encrypted.as_chunks_mut::<16>().0 {
             encryptor.encrypt_block(aes_block_mut(block));
         }
 
@@ -1050,7 +1077,7 @@ impl PasswordAlgorithm {
 
         let mut encryptor = Aes256EbcEnc::new(&key.into());
 
-        for block in bytes.chunks_exact_mut(16) {
+        for block in bytes.as_chunks_mut::<16>().0 {
             encryptor.encrypt_block(aes_block_mut(block));
         }
 
@@ -1144,7 +1171,7 @@ impl PasswordAlgorithm {
 
         let mut decryptor = Aes256EbcDec::new(&key.into());
 
-        for block in bytes.chunks_exact_mut(16) {
+        for block in bytes.as_chunks_mut::<16>().0 {
             decryptor.decrypt_block(aes_block_mut(block));
         }
 
@@ -1185,6 +1212,46 @@ impl PasswordAlgorithm {
         match self.revision {
             2..=4 => self.compute_file_encryption_key_r4(doc, password),
             5..=6 => self.compute_file_encryption_key_r6(password),
+            _ => Err(DecryptionError::UnsupportedRevision),
+        }
+    }
+
+    /// Resolve a caller-supplied password to the bytes that must actually be
+    /// passed to [`Self::compute_file_encryption_key`].
+    ///
+    /// The owner and user passwords are independent credentials — either is
+    /// sufficient to open a document — but for revisions 4 and earlier the
+    /// file encryption key (Algorithm 2) is always derived from the *user*
+    /// password specifically. If the caller supplied the user password
+    /// directly, it is returned as-is. If it only authenticates as the
+    /// *owner* password, the true user password recovered from `/O`
+    /// (Algorithm 7) is returned instead of the literal input.
+    ///
+    /// Skipping this resolution — deriving the file key straight from
+    /// whatever password authenticated — silently produces the wrong key
+    /// whenever the owner and user passwords differ: `/O`, `/U` and every
+    /// unencrypted structure (dictionaries, names, integers, references)
+    /// still parse correctly, so decryption reports success, but every
+    /// decrypted string and stream comes out as garbage. Revisions 5 and 6
+    /// have no equivalent gap — their file key is derived from `/OE`/`/UE`
+    /// via the password hash directly — so the input passes through
+    /// unchanged.
+    pub fn resolve_password_for_key_derivation<P>(
+        &self, doc: &Document, password: P,
+    ) -> Result<Vec<u8>, DecryptionError>
+    where
+        P: AsRef<[u8]>,
+    {
+        let password = password.as_ref();
+        match self.revision {
+            2..=4 => {
+                if self.authenticate_user_password_r4(doc, password).is_ok() {
+                    Ok(password.to_vec())
+                } else {
+                    self.recover_user_password_r4(doc, password)
+                }
+            }
+            5..=6 => Ok(password.to_vec()),
             _ => Err(DecryptionError::UnsupportedRevision),
         }
     }

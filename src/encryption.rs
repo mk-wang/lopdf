@@ -483,11 +483,7 @@ impl EncryptionState {
     ///
     /// Unlike [`EncryptionVersion::V4`], this preserves the password byte sequences exactly:
     /// it neither interprets them as UTF-8 nor applies PDFDocEncoding conversion.
-    pub fn aes128_r4_raw(
-        document: &mut Document,
-        owner_password: &[u8],
-        user_password: &[u8],
-    ) -> Result<Self, Error> {
+    pub fn aes128_r4_raw(document: &mut Document, owner_password: &[u8], user_password: &[u8]) -> Result<Self, Error> {
         ensure_encryption_file_identifier(document);
         let permissions = Permissions::all().correct_bits();
         let mut algorithm = PasswordAlgorithm {
@@ -499,8 +495,7 @@ impl EncryptionState {
             ..Default::default()
         };
 
-        algorithm.owner_value =
-            algorithm.compute_hashed_owner_password_r4(Some(owner_password), user_password)?;
+        algorithm.owner_value = algorithm.compute_hashed_owner_password_r4(Some(owner_password), user_password)?;
         algorithm.user_value = algorithm.compute_hashed_user_password_r3_r4(document, user_password)?;
         let file_encryption_key = algorithm.compute_file_encryption_key_r4(document, user_password)?;
         let crypt_filter: Arc<dyn CryptFilter> = Arc::new(Aes128CryptFilter);
@@ -660,7 +655,12 @@ impl EncryptionState {
         }
 
         let algorithm = PasswordAlgorithm::try_from(document)?;
-        let file_encryption_key = algorithm.compute_file_encryption_key(document, password)?;
+        // The caller may have supplied either the user or the owner password;
+        // only the user password (or the value Algorithm 7 recovers from `/O`
+        // for an owner password) is valid input to Algorithm 2. See
+        // `PasswordAlgorithm::resolve_password_for_key_derivation`.
+        let resolved_password = algorithm.resolve_password_for_key_derivation(document, password)?;
+        let file_encryption_key = algorithm.compute_file_encryption_key(document, resolved_password)?;
 
         let mut crypt_filters = document.get_crypt_filters();
 
@@ -1001,7 +1001,7 @@ mod tests {
             // Reencode cipher from a hex string to a Vec<u8>
             let cipher = cipher.as_bytes();
             let mut cipher_bytes = Vec::with_capacity(cipher.len() / 2);
-            for hex_pair in cipher.chunks_exact(2) {
+            for hex_pair in cipher.as_chunks::<2>().0 {
                 cipher_bytes.push(u8::from_str_radix(std::str::from_utf8(hex_pair).unwrap(), 16).unwrap());
             }
 

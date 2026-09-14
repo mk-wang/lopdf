@@ -611,7 +611,15 @@ pub fn decode_xref_stream_with_limit(
             .ok_or(ParseError::InvalidXref)?;
     }
 
-    let max_entries = reader.get_ref().len() / entry_width;
+    // An entry can't be read from bytes that aren't there. Validate the total before inserting
+    // anything so multiple individually plausible /Index sections cannot overrun the body, and a
+    // crafted count can never insert more map entries than the decoded bytes allow.
+    //
+    // deliberate: Records narrower than three bytes are rejected to limit amplification from
+    // decoded bytes into retained map entries. /W [1 2 0] is a plausible three-byte record and
+    // remains accepted; lopdf's writer emits /W [1 4 2], so its output is unaffected.
+    const MIN_ENTRY_WIDTH: usize = 3;
+    let max_entries = reader.get_ref().len() / entry_width.max(MIN_ENTRY_WIDTH);
     if declared_entries > max_entries {
         return Err(ParseError::InvalidXref.into());
     }

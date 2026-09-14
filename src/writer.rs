@@ -332,6 +332,9 @@ impl Document {
         self.trailer.set("Type", Name(b"XRef".to_vec()));
         self.trailer.set("Size", i64::from(size));
 
+        // The builder reads `xref.entries` directly, so entries recorded after
+        // the initial `/Size` was computed (object streams and this stream's own
+        // object) are emitted too, exactly as `write_xref` does for the table.
         let mut builder = XrefStreamBuilder::new(xref);
         let widths = builder.calculate_optimal_widths();
         let stream = builder.build_stream_content().map_err(std::io::Error::other)?;
@@ -617,12 +620,16 @@ impl Writer {
         // Add first (0) entry
         xref_section.add_unusable_free_entry();
 
-        for obj_id in 1..xref.size {
-            // If section is empty change number of starting id.
-            if xref_section.is_empty() {
-                xref_section = XrefSection::new(obj_id);
-            }
+        // Iterate over the actual highest entry instead of `xref.size`:
+        // `size` is fixed before object streams (and the xref stream itself)
+        // are appended, so entries past it would never reach the table.
+        for obj_id in 1..=xref.max_id() {
             if let Some(entry) = xref.get(obj_id) {
+                // A section starts at the first *present* id; starting it at
+                // a missing id would shift every subsequent entry by one.
+                if xref_section.is_empty() {
+                    xref_section = XrefSection::new(obj_id);
+                }
                 match *entry {
                     XrefEntry::Normal { offset, generation } => {
                         // Add entry
@@ -642,7 +649,7 @@ impl Writer {
                 // Skip over `obj_id`, but finish section if not empty.
                 if !xref_section.is_empty() {
                     xref_section.write_xref_section(file)?;
-                    xref_section = XrefSection::new(obj_id);
+                    xref_section = XrefSection::new(0);
                 }
             }
         }
@@ -653,6 +660,7 @@ impl Writer {
         }
         Ok(())
     }
+
     fn write_indirect_object<W: Write>(
         file: &mut CountingWrite<&mut W>, id: u32, generation: u16, object: &Object, xref: &mut Xref,
     ) -> Result<()> {

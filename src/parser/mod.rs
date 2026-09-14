@@ -338,7 +338,45 @@ pub(crate) fn dict_dup(input: ParserInput) -> NomResult<Dictionary> {
     .parse(input)
 }
 
-fn stream<'a>(input: ParserInput<'a>, reader: &Reader, already_seen: &mut HashSet<ObjectId>) -> NomResult<'a, Object> {
+/// Recover the sole EOL-framed `endstream` immediately followed by `endobj`.
+/// The caller must pass only bytes up to the current indirect-object boundary
+/// so the scan cannot cross into a neighboring object.
+fn recover_stream_length(input: ParserInput) -> Option<(ParserInput, ParserInput)> {
+    const ENDSTREAM: &[u8] = b"endstream";
+    let mut recovered = None;
+
+    for (position, candidate) in input.windows(ENDSTREAM.len()).enumerate() {
+        if candidate != ENDSTREAM {
+            continue;
+        }
+
+        let data_end = if input[..position].ends_with(b"\r\n") {
+            position - 2
+        } else if input[..position].ends_with(b"\n") || input[..position].ends_with(b"\r") {
+            position - 1
+        } else {
+            continue;
+        };
+        let after_endstream = &input[position + ENDSTREAM.len()..];
+        let Ok((after_endobj, _)) = preceded(space, tag(&b"endobj"[..])).parse(after_endstream) else {
+            continue;
+        };
+        if after_endobj.first().is_some_and(|&byte| !is_whitespace(byte)) {
+            continue;
+        }
+        if recovered.is_some() {
+            return None;
+        }
+        recovered = Some((after_endstream, &input[..data_end]));
+    }
+
+    recovered
+}
+
+fn stream<'a>(
+    input: ParserInput<'a>, reader: &Reader, already_seen: &mut HashSet<ObjectId>, recover_length: bool,
+    recovery_bound: Option<usize>,
+) -> NomResult<'a, Object> {
     let (i, dict) = terminated(dictionary, (space, tag(&b"stream"[..]), space0, eol)).parse(input)?;
     let declared_length = dict
         .get(b"Length")
@@ -364,16 +402,33 @@ fn stream<'a>(input: ParserInput<'a>, reader: &Reader, already_seen: &mut HashSe
         return Err(nom::Err::Failure(NomError::from_error_kind(i, ErrorKind::LengthValue)));
     }
 
-    // A damaged /Length must not make the remainder of the document part of
-    // the stream. Recover only a line-delimited endstream marker; the normal
-    // exact-length path above remains authoritative for conforming files.
-    if let Some((end, after)) = crate::stream_bounds::recovered_stream_end(i) {
-        return Ok((&i[after..], Object::Stream(Stream::new(dict, i[..end].to_vec()))));
+    if let Some(length) = declared_length {
+        // A /Length that disagrees with the bytes on disk is only recoverable
+        // inside the current indirect object: the scan stops at the xref-derived
+        // bound so it can never cross into a neighbouring one, and it accepts
+        // just one unambiguous EOL-framed `endstream` immediately followed by
+        // `endobj` -- a second candidate means the boundary cannot be inferred.
+        // `recover_length` is false for a cross-reference stream, whose payload
+        // the caller decodes rather than stores.
+        if recover_length {
+            // The bound arrived here as `input.len() - end`, and `i` starts
+            // `input.len() - i.len()` bytes later, so the scan covers exactly the
+            // first `i.len() - bound` bytes of `i`.
+            let scan_end = recovery_bound.map_or(i.len(), |bound| i.len().saturating_sub(bound));
+            if let Some((remaining, data)) = recover_stream_length(&i[..scan_end]) {
+                log::warn!(
+                    "Stream Length {length} disagrees with the unambiguous object boundary of {} bytes; using the recovered length.",
+                    data.len()
+                );
+                return Ok((remaining, Object::Stream(Stream::new(dict, data.to_vec()))));
+            }
+        }
+        return Err(nom::Err::Failure(NomError::from_error_kind(i, ErrorKind::LengthValue)));
     }
 
-    // Keep the deferred form for callers that can report a precise invalid
-    // stream error after object loading rather than silently serializing an
-    // empty stream.
+    // No /Length at all: keep the deferred form for callers that can report a
+    // precise invalid stream error after object loading rather than silently
+    // serializing an empty stream.
     Ok((i, Object::Stream(Stream::with_position(dict, input.len() - i.len()))))
 }
 
@@ -423,10 +478,13 @@ pub fn direct_object(input: ParserInput) -> Option<Object> {
     strip_nom(_direct_object(crate::reader::MAX_NESTING_DEPTH)(input))
 }
 
-fn object<'a>(input: ParserInput<'a>, reader: &Reader, already_seen: &mut HashSet<ObjectId>) -> NomResult<'a, Object> {
+fn object<'a>(
+    input: ParserInput<'a>, reader: &Reader, already_seen: &mut HashSet<ObjectId>, recover_stream_length: bool,
+    recovery_bound: Option<usize>,
+) -> NomResult<'a, Object> {
     terminated(
         alt((
-            |input| stream(input, reader, already_seen),
+            |input| stream(input, reader, already_seen, recover_stream_length, recovery_bound),
             _direct_objects(crate::reader::MAX_NESTING_DEPTH),
         )),
         space,
@@ -436,9 +494,23 @@ fn object<'a>(input: ParserInput<'a>, reader: &Reader, already_seen: &mut HashSe
 
 pub fn indirect_object(
     input: ParserInput, offset: usize, expected_id: Option<ObjectId>, reader: &Reader,
-    already_seen: &mut HashSet<ObjectId>,
+    already_seen: &mut HashSet<ObjectId>, recovery_bound: Option<usize>,
 ) -> crate::Result<(ObjectId, Object)> {
-    let (id, object, _) = indirect_object_with_remainder(input, offset, expected_id, reader, already_seen)?;
+    // Every downstream slice is a suffix of `input`, so express the absolute end
+    // offset as the maximum length a suffix may have.
+    let recovery_bound = recovery_bound.map(|end| input.len().saturating_sub(end));
+    let object_input = input.take_from(offset);
+    let (id, mut object, _) = _indirect_object(
+        object_input,
+        offset,
+        expected_id,
+        reader,
+        already_seen,
+        true,
+        recovery_bound,
+    )?;
+
+    offset_stream(&mut object, offset);
 
     Ok((id, object))
 }
@@ -451,7 +523,7 @@ pub(crate) fn indirect_object_with_remainder(
     already_seen: &mut HashSet<ObjectId>,
 ) -> crate::Result<(ObjectId, Object, usize)> {
     let object_input = input.take_from(offset);
-    let (id, mut object, rest) = _indirect_object(object_input, offset, expected_id, reader, already_seen)?;
+    let (id, mut object, rest) = _indirect_object(object_input, offset, expected_id, reader, already_seen, true, None)?;
 
     offset_stream(&mut object, offset);
 
@@ -462,7 +534,7 @@ pub(crate) fn indirect_object_with_remainder(
 
 fn _indirect_object<'a>(
     input: ParserInput<'a>, offset: usize, expected_id: Option<ObjectId>, reader: &Reader,
-    already_seen: &mut HashSet<ObjectId>,
+    already_seen: &mut HashSet<ObjectId>, recover_stream_length: bool, recovery_bound: Option<usize>,
 ) -> crate::Result<(ObjectId, Object, ParserInput<'a>)> {
     let (i, (_, object_id)) = terminated((space, object_id), pair(tag(&b"obj"[..]), space))
         .parse(input)
@@ -475,7 +547,7 @@ fn _indirect_object<'a>(
 
     let object_offset = input.len() - i.len();
     let (rest, mut object) = terminated(
-        |i: ParserInput<'a>| object(i, reader, already_seen),
+        |i: ParserInput<'a>| object(i, reader, already_seen, recover_stream_length, recovery_bound),
         (space, opt(tag(&b"endobj"[..])), space),
     )
     .parse(i)
@@ -525,17 +597,20 @@ pub fn binary_mark(input: ParserInput) -> Option<Vec<u8>> {
 }
 
 /// Decode CrossReferenceTable
-fn xref(input: ParserInput) -> NomResult<Xref> {
-    let xref_eol = map(
-        alt((
-            tag(&b" \r"[..]),
-            tag(&b" \n"[..]),
-            tag(&b"\r\n"[..]),
-            tag(&b"\n"[..]),
-            tag(&b"\r"[..]),
-        )),
-        |_| (),
-    );
+fn xref(input: ParserInput, strict: bool) -> NomResult<Xref> {
+    // ISO 32000-1 s7.5.4 requires every entry to be exactly 20 bytes, ending in one of the
+    // 2-byte terminators SP CR, SP LF or CR LF. Many generators instead emit 19-byte entries
+    // ending in a bare LF, which qpdf, pikepdf, PDFium and PDF.js all accept. Accept those
+    // too when parsing leniently, but keep the conforming 2-byte forms first in the `alt` so
+    // that a bare CR never matches the CR of a conforming CR LF and strands its LF.
+    let xref_eol = move |i| {
+        let conforming = alt((tag(&b" \r"[..]), tag(&b" \n"[..]), tag(&b"\r\n"[..])));
+        if strict {
+            map(conforming, |_| ()).parse(i)
+        } else {
+            map(alt((conforming, tag(&b"\n"[..]), tag(&b"\r"[..]))), |_| ()).parse(i)
+        }
+    };
     let xref_entry = map_res(
         pair(
             separated_pair(unsigned_int::<u64>, tag(&b" "[..]), unsigned_int::<u64>),
@@ -552,17 +627,15 @@ fn xref(input: ParserInput) -> NomResult<Xref> {
         },
     );
 
-    let xref_section = map_res(
+    // The subsection header's start is untrusted, so it is kept wide; the fold
+    // below skips (and reports) object numbers that u32 object ids cannot hold,
+    // rather than failing the whole cross-reference section for one bad header.
+    let xref_section = map(
         pair(
             separated_pair(unsigned_int::<u64>, tag(&b" "[..]), unsigned_int::<u64>),
             preceded(pair(opt(tag(&b" "[..])), eol), many0(xref_entry)),
         ),
-        |((start, _count), entries)| -> Result<(u32, Vec<Option<XrefEntry>>), ()> {
-            let start = u32::try_from(start).map_err(|_| ())?;
-            let entry_count = u32::try_from(entries.len()).map_err(|_| ())?;
-            start.checked_add(entry_count).ok_or(())?;
-            Ok((start, entries))
-        },
+        |((start, _count), entries)| (start, entries),
     );
 
     delimited(
@@ -571,11 +644,23 @@ fn xref(input: ParserInput) -> NomResult<Xref> {
             xref_section,
             || -> Xref { Xref::new(0, XrefType::CrossReferenceTable) },
             |mut xref, (start, entries)| {
-                for (index, entry) in (0_u32..)
-                    .zip(entries)
-                    .filter_map(|(index, entry)| entry.map(|entry| (index, entry)))
-                {
-                    xref.insert(start + index, entry);
+                let mut skipped = 0usize;
+                for (index, entry) in (0_u64..).zip(entries) {
+                    let Some(entry) = entry else { continue };
+                    // `start` is read from the subsection header, so it is untrusted:
+                    // `start + index` can overflow, and object numbers are u32, so an
+                    // unrepresentable number would otherwise truncate into a
+                    // valid-looking one that silently displaces a legitimate entry.
+                    match start.checked_add(index).and_then(|id| u32::try_from(id).ok()) {
+                        Some(id) => xref.insert(id, entry),
+                        None => skipped += 1,
+                    }
+                }
+                if skipped > 0 {
+                    log::warn!(
+                        "cross-reference subsection starting at {start} has {skipped} entr{} with an object number beyond u32; skipping",
+                        if skipped == 1 { "y" } else { "ies" }
+                    );
                 }
                 xref
             },
@@ -590,7 +675,7 @@ fn trailer(input: ParserInput) -> NomResult<Dictionary> {
 }
 
 pub fn xref_and_trailer(input: ParserInput, reader: &Reader) -> crate::Result<(Xref, Dictionary)> {
-    let xref_trailer = map(pair(xref, trailer), |(mut xref, trailer)| {
+    let xref_trailer = map(pair(|i| xref(i, reader.strict), trailer), |(mut xref, trailer)| {
         xref.size = trailer
             .get(b"Size")
             .and_then(Object::as_i64)
@@ -601,7 +686,7 @@ pub fn xref_and_trailer(input: ParserInput, reader: &Reader) -> crate::Result<(X
     alt((
         xref_trailer,
         (|input| {
-            _indirect_object(input, 0, None, reader, &mut HashSet::new())
+            _indirect_object(input, 0, None, reader, &mut HashSet::new(), false, None)
                 .map(|(_, obj, _)| {
                     let res = match obj {
                         Object::Stream(stream) => decode_xref_stream_with_limit(stream, reader.max_decompressed_size),
@@ -932,7 +1017,7 @@ startxref
 153804\x20
 %%EOF
 ";
-        match xref(test_span(input)) {
+        match xref(test_span(input), false) {
             Ok((_, re)) => assert_eq!(re.entries.len(), 15),
             Err(err) => panic!("unexpected {:?}", err),
         }
@@ -1060,9 +1145,165 @@ EI";
     fn xref_trailing_space_after_keyword() {
         // Some PDF generators emit "xref \n" with a trailing space.
         let input = b"xref \n0 3\n0000000000 65535 f \n0000000017 00000 n \n0000000081 00000 n \ntrailer\n<</Size 3/Root 1 0 R>>\nstartxref\n175\n%%EOF\n";
-        match xref(test_span(input)) {
+        match xref(test_span(input), false) {
             Ok((_, re)) => assert_eq!(re.entries.len(), 2),
             Err(err) => panic!("xref with trailing space should parse: {:?}", err),
+        }
+    }
+
+    #[test]
+    fn xref_entries_with_bare_eol_terminator() {
+        // ISO 32000-1 s7.5.4 requires 20-byte entries, so the terminator is two bytes
+        // (" \r", " \n" or "\r\n"). Many generators drop the padding space and emit
+        // 19-byte entries ending in a bare "\n"; qpdf, pikepdf, PDFium and PDF.js all
+        // accept these, so lenient parsing accepts them too.
+        for (name, input) in [
+            (
+                "bare LF",
+                &b"xref\n0 3\n0000000000 65535 f\n0000000017 00000 n\n0000000081 00000 n\ntrailer\n<</Size 3/Root 1 0 R>>\n"[..],
+            ),
+            (
+                "bare CR",
+                &b"xref\n0 3\n0000000000 65535 f\r0000000017 00000 n\r0000000081 00000 n\rtrailer\n<</Size 3/Root 1 0 R>>\n"[..],
+            ),
+        ] {
+            match xref(test_span(input), false) {
+                Ok((_, re)) => assert_eq!(re.entries.len(), 2, "{name} should yield both normal entries"),
+                Err(err) => panic!("19-byte entries ({name}) should parse when lenient: {err:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn xref_entries_with_bare_eol_rejected_when_strict() {
+        // The 19-byte form is non-conforming, so strict mode must keep rejecting it.
+        // At this level the rejection is indirect: the entries simply are not recognised,
+        // leaving an empty section whose unconsumed lines then displace `trailer`. Assert
+        // both halves -- the empty table here, and the document-level failure below.
+        let input =
+            b"xref\n0 3\n0000000000 65535 f\n0000000017 00000 n\n0000000081 00000 n\ntrailer\n<</Size 3/Root 1 0 R>>\n";
+        if let Ok((_, re)) = xref(test_span(input), true) {
+            assert_eq!(re.entries.len(), 0, "strict must not accept 19-byte entries");
+        }
+
+        // The contract that matters to callers: a document with 19-byte entries loads
+        // leniently and is refused under `LoadOptions::strict`. The 20-byte build of the
+        // very same document is the control -- it must load in *both* modes, so that the
+        // strict rejection below is attributable to the terminator and nothing else.
+        let load = |bytes: &[u8], strict: bool| {
+            crate::Document::load_mem_with_options(
+                bytes,
+                crate::LoadOptions {
+                    strict,
+                    ..Default::default()
+                },
+            )
+        };
+
+        for (name, term, strict_should_load) in [("19-byte", "\n", false), ("20-byte", " \n", true)] {
+            let header = "%PDF-1.7\n";
+            let obj1 = "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n";
+            let obj2 = "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n";
+            let obj3 = "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] >>\nendobj\n";
+            let o1 = header.len();
+            let o2 = o1 + obj1.len();
+            let o3 = o2 + obj2.len();
+            let body = format!("{header}{obj1}{obj2}{obj3}");
+            let xref_pos = body.len();
+            let doc = format!(
+                "{body}xref\n0 4\n0000000000 65535 f{term}{o1:010} 00000 n{term}{o2:010} 00000 n{term}\
+                 {o3:010} 00000 n{term}trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref_pos}\n%%EOF\n"
+            );
+
+            assert!(
+                load(doc.as_bytes(), false).is_ok(),
+                "{name} entries should load when lenient"
+            );
+            assert_eq!(
+                load(doc.as_bytes(), true).is_ok(),
+                strict_should_load,
+                "{name} entries under strict parsing"
+            );
+        }
+    }
+
+    #[test]
+    fn xref_entries_with_conforming_terminators() {
+        // The three 20-byte terminators of s7.5.4 must keep parsing in both modes. In
+        // particular the bare-CR alternative must not match the CR of a "\r\n" pair and
+        // strand its LF, which would break the following entry.
+        for (name, input) in [
+            (
+                "SP LF",
+                &b"xref\n0 3\n0000000000 65535 f \n0000000017 00000 n \n0000000081 00000 n \ntrailer\n<</Size 3/Root 1 0 R>>\n"[..],
+            ),
+            (
+                "SP CR",
+                &b"xref\n0 3\n0000000000 65535 f \r0000000017 00000 n \r0000000081 00000 n \rtrailer\n<</Size 3/Root 1 0 R>>\n"[..],
+            ),
+            (
+                "CR LF",
+                &b"xref\n0 3\n0000000000 65535 f\r\n0000000017 00000 n\r\n0000000081 00000 n\r\ntrailer\n<</Size 3/Root 1 0 R>>\n"[..],
+            ),
+        ] {
+            for strict in [false, true] {
+                match xref(test_span(input), strict) {
+                    Ok((_, re)) => assert_eq!(re.entries.len(), 2, "{name} (strict={strict}) lost an entry"),
+                    Err(err) => panic!("conforming {name} entries should parse (strict={strict}): {err:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn xref_subsection_start_near_usize_max_is_skipped() {
+        // A subsection header's start is read straight from the file, so it is untrusted.
+        // A start of usize::MAX made `start + index` overflow: a panic wherever overflow
+        // checks are on (a denial of service for any consumer parsing untrusted PDFs), and
+        // a silent wrap to object 0 where they are not.
+        let input = &b"xref\n18446744073709551615 2\n0000000000 65535 f \n0000000009 00000 n \ntrailer\n<</Size 2/Root 1 0 R>>\n"[..];
+        for strict in [false, true] {
+            match xref(test_span(input), strict) {
+                Ok((_, re)) => assert!(
+                    re.entries.is_empty(),
+                    "unrepresentable object number was inserted (strict={strict}): {:?}",
+                    re.entries
+                ),
+                Err(err) => panic!("xref should still parse (strict={strict}): {err:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn xref_subsection_start_beyond_u32_does_not_displace_entries() {
+        // Object numbers are u32, but the subsection start is parsed as usize and was cast
+        // with `as u32`. A start above u32::MAX truncated into a valid-looking number --
+        // 4294967297 becomes 1 -- silently overwriting a legitimate entry with an arbitrary
+        // offset. No overflow occurs here, so a checked add alone would not catch it.
+        let input = &b"xref\n0 2\n0000000000 65535 f \n0000000009 00000 n \n4294967297 1\n0000000999 00000 n \ntrailer\n<</Size 2/Root 1 0 R>>\n"[..];
+        for strict in [false, true] {
+            match xref(test_span(input), strict) {
+                Ok((_, re)) => {
+                    assert_eq!(
+                        re.entries.len(),
+                        1,
+                        "(strict={strict}) unexpected entries: {:?}",
+                        re.entries
+                    );
+                    assert!(
+                        matches!(
+                            re.get(1),
+                            Some(XrefEntry::Normal {
+                                offset: 9,
+                                generation: 0
+                            })
+                        ),
+                        "entry for object 1 was displaced (strict={strict}): {:?}",
+                        re.get(1)
+                    );
+                }
+                Err(err) => panic!("xref should still parse (strict={strict}): {err:?}"),
+            }
         }
     }
 
