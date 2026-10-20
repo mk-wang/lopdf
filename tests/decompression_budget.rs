@@ -187,6 +187,21 @@ fn xref_and_object_streams_share_one_budget() {
 }
 
 #[test]
+fn xref_reconstruction_preserves_the_budget_error() {
+    let (mut pdf, xref_len, _) = pdf_with_xref_stream_and_objstm(300);
+    let marker = b"startxref";
+    let start = pdf.windows(marker.len()).rposition(|bytes| bytes == marker).unwrap();
+    pdf.truncate(start);
+    pdf.extend_from_slice(b"%%EOF\n");
+    let repaired = Document::load_mem_with_options(&pdf, LoadOptions::default()).unwrap();
+    assert!(repaired.objects.contains_key(&(1, 0)));
+    assert_budget_error(
+        Document::load_mem_with_options(&pdf, LoadOptions::with_max_total_decompressed_size(xref_len - 1)),
+        xref_len - 1,
+    );
+}
+
+#[test]
 fn corrupt_object_stream_is_not_reported_as_budget_exhaustion() {
     let (content, _) = objstm_payload(100, 64);
     // Declare a /First offset past the decoded payload: a structural error,
