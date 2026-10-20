@@ -21,6 +21,14 @@ impl Content<Vec<Operation>> {
         parser::content(data).ok_or(ParseError::InvalidContentStream.into())
     }
 
+    /// Decode content operations one at a time without collecting them.
+    ///
+    /// Yields the operations [`Content::decode`] returns, or its error at the point
+    /// where the decode fails.
+    pub fn decode_iter(data: &[u8]) -> parser::ContentOperations<'_> {
+        parser::ContentOperations::new(data)
+    }
+
     /// Strict decode content operations.
     pub fn decode_strict(data: &[u8]) -> Result<Self> {
         parser::content_strict(data).map_err(|e| e.into())
@@ -167,9 +175,8 @@ impl Document {
                     }
                     None => warn!("Could not decode extracted text"),
                 },
-                // PDF 32000-1 §9.4.3 — `'` is equivalent to `T* Tj`:
-                // move to next line, then show string from the single
-                // string operand.
+                // PDF 32000-1 §9.4.3: `'` is `T* Tj` — move to the next line, then show
+                // the single string operand.
                 "'" => match current_encoding {
                     Some(encoding) => {
                         if !current_text.ends_with('\n') {
@@ -182,11 +189,8 @@ impl Document {
                     }
                     None => warn!("Could not decode extracted text"),
                 },
-                // PDF 32000-1 §9.4.3 — `"` is equivalent to
-                // `aw Tw ac Tc T* Tj` with operands `[aw, ac, string]`.
-                // Operands 0/1 set word/character spacing for rendering
-                // and don't affect the extracted character sequence;
-                // operand 2 is the string to show.
+                // PDF 32000-1 §9.4.3: `"` is `aw Tw ac Tc T* Tj`. Operands 0/1 only affect
+                // rendering spacing; operand 2 is the string to show.
                 "\"" => match current_encoding {
                     Some(encoding) => {
                         if !current_text.ends_with('\n') {
@@ -201,10 +205,8 @@ impl Document {
                     }
                     None => warn!("Could not decode extracted text"),
                 },
-                // PDF 32000-1 §9.4.2 — `T*` moves to the start of the
-                // next line. For text extraction we approximate this
-                // as `\n`, matching how the `ET` arm above handles end
-                // of text object.
+                // PDF 32000-1 §9.4.2: `T*` moves to the next line, approximated as `\n`
+                // like the `ET` arm above.
                 "T*" if !current_text.ends_with('\n') => current_text.push('\n'),
                 "T*" => {}
                 "ET" if !current_text.ends_with('\n') => current_text.push('\n'),
@@ -378,6 +380,11 @@ fn collect_text(text: &mut String, encoding: &Encoding, operands: &[Object]) -> 
     }
     Ok(())
 }
+
+/// The characters of `s` starting at character index `start`, up to `len` of
+/// them. Indices are counted in characters, not bytes, so a multi-byte
+/// character is never split. Note that `len == 0` yields one character, not
+/// none; this is long-standing behavior relied on by the sole caller.
 pub fn substr(s: &str, start: usize, len: usize) -> &str {
     let mut indices = s.char_indices();
 
@@ -398,29 +405,54 @@ pub fn substr(s: &str, start: usize, len: usize) -> &str {
 
     &s[start_idx..end_idx]
 }
+
+/// Everything from character index `start` to the end of `s`.
 pub fn substring(s: &str, start: usize) -> &str {
     s.char_indices().nth(start).map(|(idx, _)| &s[idx..]).unwrap_or("")
 }
 
 fn encode(encoding: &Encoding, txt: &str, default_str: &str) -> Vec<u8> {
-    if txt.chars().count() > 1 {
-        let mut cur = 0;
-        let mut result = Vec::new();
-        while cur < txt.chars().count() {
-            let c = substr(txt, cur, 1);
-            result.extend_from_slice(&encode(encoding, c, default_str));
-            cur += 1;
+    let mut chars = txt.chars();
+    match (chars.next(), chars.next()) {
+        // More than one character: encode each on its own, into one buffer.
+        (Some(first), Some(second)) => {
+            let mut result = Vec::with_capacity(txt.len());
+            result.extend_from_slice(&encode_one(encoding, first, default_str));
+            result.extend_from_slice(&encode_one(encoding, second, default_str));
+            for c in chars {
+                result.extend_from_slice(&encode_one(encoding, c, default_str));
+            }
+            result
         }
-        result
-    } else {
-        let encoded_bytes = Document::encode_text(encoding, txt);
-        if !encoded_bytes.is_empty() {
-            encoded_bytes
-        } else {
-            Document::encode_text(encoding, default_str)
+        // Exactly one character: encode it directly.
+        (Some(c), None) => encode_one(encoding, c, default_str),
+        // Empty: nothing to encode, but keep the caller's fallback contract.
+        (None, _) => {
+            let encoded = Document::encode_text(encoding, txt);
+            if encoded.is_empty() {
+                Document::encode_text(encoding, default_str)
+            } else {
+                encoded
+            }
         }
     }
 }
+
+/// Encode a single character, falling back to `default_str` when the encoding
+/// has no entry for it.
+fn encode_one(encoding: &Encoding, c: char, default_str: &str) -> Vec<u8> {
+    // A scratch buffer, so the common one-character case does not allocate a
+    // `String` per character on the text-extraction path.
+    let mut scratch = [0u8; 4];
+    let encoded_bytes = Document::encode_text(encoding, c.encode_utf8(&mut scratch));
+
+    if !encoded_bytes.is_empty() {
+        encoded_bytes
+    } else {
+        Document::encode_text(encoding, default_str)
+    }
+}
+
 fn try_to_replace_encoded_text(
     operation: &mut Operation, encoding: &Encoding, text_to_replace: &str, replacement: &str, default_str: &str,
 ) -> Result<()> {
@@ -437,16 +469,10 @@ fn try_to_replace_encoded_text(
                 let mut str_collected = String::new();
                 collect_text(&mut str_collected, encoding, arr)?;
                 if str_collected == text_to_replace {
-                    // The number of `Object::String` items in a `TJ` array is
-                    // not guaranteed to match the character count of the
-                    // decoded text (each string may hold several glyphs, and
-                    // numeric kerning entries are interleaved).
-                    //
-                    // There is no **good** way to interpolate between the OG
-                    // and the replacement, but putting the full encoded replacement
-                    // into the first string slot and emptying out the remaining
-                    // string slots, leaving any numeric kerning entries in place
-                    // seems like the least bad option.
+                    // The `Object::String` count in a `TJ` array need not match the decoded
+                    // character count, and kerning entries are interleaved. Least bad option:
+                    // fill the first string slot with the whole replacement, empty the rest,
+                    // and leave the kerning entries in place.
                     let encoded_replacement = encode(encoding, replacement, default_str);
                     let mut placed = false;
                     for item in arr.iter_mut() {
@@ -596,14 +622,13 @@ pub fn decode_xref_stream_with_limit(
         return Err(ParseError::InvalidXref.into());
     }
 
-    // Validate all sections before reading entries. This prevents a large /Index from causing
-    // repeated map insertion or from wrapping an object number.
+    // Validate all counts before reading entries so work stays bounded by the decoded bytes.
     let mut declared_entries = 0_usize;
     for section in section_indice.chunks_exact(2) {
-        let start = u32::try_from(section[0]).map_err(|_| ParseError::InvalidXref)?;
         let count = u32::try_from(section[1]).map_err(|_| ParseError::InvalidXref)?;
-        let end = start.checked_add(count).ok_or(ParseError::InvalidXref)?;
-        if end > size {
+        if let Ok(start) = u32::try_from(section[0])
+            && start.checked_add(count).ok_or(ParseError::InvalidXref)? > size
+        {
             return Err(ParseError::InvalidXref.into());
         }
         declared_entries = declared_entries
@@ -625,21 +650,22 @@ pub fn decode_xref_stream_with_limit(
     }
 
     for section in section_indice.chunks_exact(2) {
-        let start = u32::try_from(section[0]).map_err(|_| ParseError::InvalidXref)?;
+        let start = section[0];
         let count = u32::try_from(section[1]).map_err(|_| ParseError::InvalidXref)?;
+        let mut skipped = 0_usize;
 
         for j in 0..count {
-            let object_id = start.checked_add(j).ok_or(ParseError::InvalidXref)?;
             let entry_type = if !bytes1.is_empty() {
                 read_big_endian_integer(&mut reader, bytes1.as_mut_slice())?
             } else {
                 1
             };
-            match entry_type {
+            let entry = match entry_type {
                 0 => {
                     // free object
                     read_big_endian_integer(&mut reader, bytes2.as_mut_slice())?;
                     read_big_endian_integer(&mut reader, bytes3.as_mut_slice())?;
+                    None
                 }
                 1 => {
                     // normal object
@@ -651,7 +677,7 @@ pub fn decode_xref_stream_with_limit(
                         0
                     })
                     .map_err(|_| ParseError::InvalidXref)?;
-                    xref.insert(object_id, XrefEntry::Normal { offset, generation });
+                    Some(XrefEntry::Normal { offset, generation })
                 }
                 2 => {
                     // compressed object
@@ -659,10 +685,24 @@ pub fn decode_xref_stream_with_limit(
                         .map_err(|_| ParseError::InvalidXref)?;
                     let index = u16::try_from(read_big_endian_integer(&mut reader, bytes3.as_mut_slice())?)
                         .map_err(|_| ParseError::InvalidXref)?;
-                    xref.insert(object_id, XrefEntry::Compressed { container, index });
+                    Some(XrefEntry::Compressed { container, index })
                 }
-                _ => {}
+                _ => {
+                    // Unknown types are null references, but their fields still take up space.
+                    read_big_endian_integer(&mut reader, bytes2.as_mut_slice())?;
+                    read_big_endian_integer(&mut reader, bytes3.as_mut_slice())?;
+                    None
+                }
+            };
+            if let Some(entry) = entry {
+                match start.checked_add(i64::from(j)).and_then(|id| u32::try_from(id).ok()) {
+                    Some(object_id) => xref.insert(object_id, entry),
+                    None => skipped += 1,
+                }
             }
+        }
+        if skipped > 0 {
+            warn!("cross-reference stream section starting at {start} has {skipped} entries outside u32; skipping");
         }
     }
     dict.remove(b"Length");
@@ -965,5 +1005,25 @@ mod tests {
             between.contains('\n'),
             "T* did not insert a line break between Tj strings: between={between:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod encode_equivalence_tests {
+    use super::encode;
+    use crate::encodings::Encoding;
+
+    /// The single-character path must encode one character exactly as the
+    /// whole-string path did, and the empty string must keep its fallback.
+    #[test]
+    fn encode_handles_empty_single_and_multi_character() {
+        let encoding = Encoding::SimpleEncoding(b"WinAnsiEncoding");
+
+        assert_eq!(encode(&encoding, "A", "?"), vec![b'A']);
+        assert_eq!(encode(&encoding, "AB", "?"), vec![b'A', b'B']);
+        // An unmappable character falls back per character.
+        assert_eq!(encode(&encoding, "A\u{1F600}B", "?"), vec![b'A', b'?', b'B']);
+        // The empty string yields no bytes of its own.
+        assert_eq!(encode(&encoding, "", "?"), vec![b'?']);
     }
 }

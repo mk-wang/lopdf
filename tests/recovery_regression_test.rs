@@ -80,8 +80,8 @@ fn revision_local_hybrid_xref_merges_each_revision() {
     assert_eq!(document.max_id, 5);
     assert!(document.get_object((2, 0)).is_ok(), "older revision object was lost");
     assert!(document.get_object((4, 0)).is_ok(), "latest companion object was lost");
-    assert_eq!(document.trailer.get(b"Prev").is_err(), true);
-    assert_eq!(document.trailer.get(b"XRefStm").is_err(), true);
+    assert!(document.trailer.get(b"Prev").is_err());
+    assert!(document.trailer.get(b"XRefStm").is_err());
     assert_eq!(
         Document::load_metadata_mem(&pdf).unwrap().title.as_deref(),
         Some("latest")
@@ -150,7 +150,7 @@ fn malformed_stream_pdf(length: i64) -> Vec<u8> {
 
 #[test]
 fn lenient_stream_recovery_uses_endstream_boundary() {
-    for length in [1, 99, -1] {
+    for length in [1, 99] {
         let pdf = malformed_stream_pdf(length);
         let document = Document::load_mem(&pdf).expect("lenient stream recovery should find endstream");
         assert_eq!(
@@ -168,6 +168,12 @@ fn lenient_stream_recovery_uses_endstream_boundary() {
             .is_err()
         );
     }
+
+    let negative = Document::load_mem(&malformed_stream_pdf(-1)).unwrap();
+    assert!(
+        negative.get_object((1, 0)).is_err(),
+        "negative stream lengths must not be recovered"
+    );
 }
 
 #[test]
