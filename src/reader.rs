@@ -22,6 +22,7 @@ use crate::common_data_structures;
 use crate::encryption::{self, EncryptionState};
 use crate::error::{ParseError, XrefError};
 use crate::load_options::{FilterFunc, LoadOptions};
+use crate::object::DecompressionBudget;
 use crate::object_stream::ObjectStream;
 use crate::parser;
 use crate::xref::{Xref, XrefEntry, XrefType};
@@ -89,6 +90,7 @@ impl Document {
             password: options.password,
             strict: options.strict,
             max_decompressed_size: options.max_decompressed_size,
+            decompression_budget: options.max_total_decompressed_size.map(DecompressionBudget::new),
             normal_offsets: Vec::new(),
         }
         .read(options.filter)
@@ -110,6 +112,7 @@ impl Document {
             password: options.password,
             strict: options.strict,
             max_decompressed_size: options.max_decompressed_size,
+            decompression_budget: options.max_total_decompressed_size.map(DecompressionBudget::new),
             normal_offsets: Vec::new(),
         }
         .read(options.filter)
@@ -133,6 +136,7 @@ impl Document {
             raw_password: Some(password),
             strict: options.strict,
             max_decompressed_size: options.max_decompressed_size,
+            decompression_budget: options.max_total_decompressed_size.map(DecompressionBudget::new),
             normal_offsets: Vec::new(),
         }
         .read(options.filter)
@@ -185,6 +189,7 @@ impl Document {
             password: None,
             strict: false,
             max_decompressed_size: None,
+            decompression_budget: None,
             normal_offsets: Vec::new(),
         }
         .read_metadata()
@@ -202,6 +207,7 @@ impl Document {
             password: Some(password.to_string()),
             strict: false,
             max_decompressed_size: None,
+            decompression_budget: None,
             normal_offsets: Vec::new(),
         }
         .read_metadata()
@@ -222,6 +228,7 @@ impl Document {
             password,
             strict: false,
             max_decompressed_size: None,
+            decompression_budget: None,
             normal_offsets: Vec::new(),
         }
         .read_metadata()
@@ -267,6 +274,7 @@ impl Document {
             password: options.password,
             strict: options.strict,
             max_decompressed_size: options.max_decompressed_size,
+            decompression_budget: options.max_total_decompressed_size.map(DecompressionBudget::new),
             normal_offsets: Vec::new(),
         }
         .read(options.filter)
@@ -288,6 +296,7 @@ impl Document {
             password: options.password,
             strict: options.strict,
             max_decompressed_size: options.max_decompressed_size,
+            decompression_budget: options.max_total_decompressed_size.map(DecompressionBudget::new),
             normal_offsets: Vec::new(),
         }
         .read(options.filter)
@@ -336,6 +345,7 @@ impl Document {
             password: None,
             strict: false,
             max_decompressed_size: None,
+            decompression_budget: None,
             normal_offsets: Vec::new(),
         }
         .read_metadata()
@@ -353,6 +363,7 @@ impl Document {
             password: Some(password.to_string()),
             strict: false,
             max_decompressed_size: None,
+            decompression_budget: None,
             normal_offsets: Vec::new(),
         }
         .read_metadata()
@@ -375,6 +386,7 @@ impl Document {
             password,
             strict: false,
             max_decompressed_size: None,
+            decompression_budget: None,
             normal_offsets: Vec::new(),
         }
         .read_metadata()
@@ -394,6 +406,7 @@ impl TryInto<Document> for &[u8] {
             password: None,
             strict: false,
             max_decompressed_size: None,
+            decompression_budget: None,
             normal_offsets: Vec::new(),
         }
         .read(None)
@@ -429,6 +442,7 @@ impl IncrementalDocument {
             password: None,
             strict: false,
             max_decompressed_size: None,
+            decompression_budget: None,
             normal_offsets: Vec::new(),
         }
         .read(None)?;
@@ -474,6 +488,7 @@ impl IncrementalDocument {
             password: None,
             strict: false,
             max_decompressed_size: None,
+            decompression_budget: None,
             normal_offsets: Vec::new(),
         }
         .read(None)?;
@@ -500,6 +515,7 @@ impl TryInto<IncrementalDocument> for &[u8] {
             password: None,
             strict: false,
             max_decompressed_size: None,
+            decompression_budget: None,
             normal_offsets: Vec::new(),
         }
         .read(None)?;
@@ -519,8 +535,14 @@ pub struct Reader<'a> {
     /// Maximum decompressed size, in bytes, allowed for any single stream
     /// (object streams and cross-reference streams) decoded during loading.
     /// `None` (the default) applies no limit; set it to guard against
-    /// decompression bombs. See [`crate::LoadOptions`].
+    /// decompression bombs. See [`crate::LoadOptions`] and
+    /// [`crate::LoadOptions::max_total_decompressed_size`] for the aggregate
+    /// per-load bound.
     pub max_decompressed_size: Option<usize>,
+    /// Aggregate decompressed-byte budget shared by every object stream and
+    /// cross-reference stream decoded during this load. `None` disables it.
+    /// See [`crate::LoadOptions::max_total_decompressed_size`].
+    pub(crate) decompression_budget: Option<DecompressionBudget>,
     /// Sorted unique byte offsets of every `XrefEntry::Normal` entry in the
     /// final cross-reference table. Built once when the table is complete so
     /// object-boundary lookups can binary-search the successor offset instead
@@ -1138,7 +1160,11 @@ impl Reader<'_> {
                 if let Some(container_obj) = self.document.objects.get(&(container_id, 0))
                     && let Ok(stream) = container_obj.as_stream()
                 {
-                    match ObjectStream::new_with_limit(stream, self.max_decompressed_size) {
+                    match ObjectStream::new_with_budget(
+                        stream,
+                        self.max_decompressed_size,
+                        self.decompression_budget.as_ref(),
+                    ) {
                         Ok(object_stream) => {
                             for (obj_num, _index) in objects_in_stream {
                                 let obj_id = (obj_num, 0);
@@ -1147,6 +1173,10 @@ impl Reader<'_> {
                                 }
                             }
                         }
+                        // Exhausting the aggregate budget is a resource limit,
+                        // not a damaged object stream that lenient recovery may
+                        // drop silently.
+                        Err(err) if self.is_budget_exhausted(&err) => return Err(err),
                         Err(_e) => {}
                     }
                 }
@@ -1242,13 +1272,23 @@ impl Reader<'_> {
 
                 if let Ok(stream) = object.as_stream() {
                     if stream.dict.has_type(b"ObjStm") && !is_encrypted {
-                        let obj_stream = match ObjectStream::new_with_limit(stream, self.max_decompressed_size) {
+                        let obj_stream = match ObjectStream::new_with_budget(
+                            stream,
+                            self.max_decompressed_size,
+                            self.decompression_budget.as_ref(),
+                        ) {
                             Ok(obj_stream) => obj_stream,
                             // Not an encryption-related loss, so it obeys the same
-                            // strict-mode policy as any other load error.
+                            // strict-mode policy as any other load error — except
+                            // aggregate budget exhaustion, which lenient loading
+                            // must never hide.
                             Err(e) => {
                                 error!("Object stream load error for {object_id:?}: {e:?}");
-                                return if self.strict { Err(e) } else { Ok(None) };
+                                return if self.strict || self.is_budget_exhausted(&e) {
+                                    Err(e)
+                                } else {
+                                    Ok(None)
+                                };
                             }
                         };
                         let container_id = object_id.0;
@@ -1387,6 +1427,18 @@ impl Reader<'_> {
         }
     }
 
+    /// Whether `err` is the per-load aggregate budget refusing more decode
+    /// work. Unlike the per-stream cap, this is never hidden by lenient
+    /// recovery.
+    fn is_budget_exhausted(&self, err: &Error) -> bool {
+        match (err, self.decompression_budget.as_ref()) {
+            (Error::Decompress(crate::error::DecompressError::MemoryLimitExceeded { limit }), Some(budget)) => {
+                *limit == budget.limit()
+            }
+            _ => false,
+        }
+    }
+
     /// Load a compressed object from an object stream (for lightweight metadata extraction)
     fn get_compressed_object(&self, id: ObjectId) -> Result<Object> {
         let entry = self.document.reference_table.get(id.0).ok_or(Error::MissingXrefEntry)?;
@@ -1400,7 +1452,11 @@ impl Reader<'_> {
         let mut already_seen = HashSet::new();
         let container_obj = self.get_object(container_id, &mut already_seen)?;
         let container_stream = container_obj.as_stream()?;
-        let object_stream = ObjectStream::new_with_limit(container_stream, self.max_decompressed_size)?;
+        let object_stream = ObjectStream::new_with_budget(
+            container_stream,
+            self.max_decompressed_size,
+            self.decompression_budget.as_ref(),
+        )?;
         object_stream.objects.get(&id).cloned().ok_or(Error::MissingXrefEntry)
     }
 

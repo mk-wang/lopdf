@@ -51,12 +51,15 @@ impl ObjectStream {
     /// decoded content if it would exceed `max_decompressed_size` bytes. `None`
     /// means no limit (the behavior of [`ObjectStream::new`]).
     pub fn new_with_limit(stream: &Stream, max_decompressed_size: Option<usize>) -> Result<ObjectStream> {
-        let content = match max_decompressed_size {
-            // Object streams are decoded while the document is loaded, so
-            // enforcing the limit here bounds the memory a single stream can use.
-            Some(max) => stream.get_plain_content_with_limit(max)?,
-            None => stream.get_plain_content()?,
-        };
+        Self::new_with_budget(stream, max_decompressed_size, None)
+    }
+
+    /// Parse an existing object stream, applying both the per-stream cap and
+    /// the per-load aggregate decompression budget.
+    pub(crate) fn new_with_budget(
+        stream: &Stream, max_decompressed_size: Option<usize>, budget: Option<&crate::object::DecompressionBudget>,
+    ) -> Result<ObjectStream> {
+        let content = stream.get_plain_content_with_budget(max_decompressed_size, budget)?;
 
         if content.is_empty() {
             return Ok(ObjectStream {

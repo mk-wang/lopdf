@@ -49,6 +49,20 @@ pub struct LoadOptions {
     ///
     /// `None` (the default) applies no limit.
     pub max_decompressed_size: Option<usize>,
+    /// Maximum number of bytes that *all* streams decoded during one load may
+    /// produce in total (object streams and cross-reference streams, including
+    /// revisions, recovery passes and encrypted documents).
+    ///
+    /// [`LoadOptions::max_decompressed_size`] bounds each stream separately, so
+    /// a file with many small object streams can still inflate to an arbitrary
+    /// total. This budget is shared for the whole load and is charged while each
+    /// stream is decoded, before its output is buffered. Exhausting it always
+    /// fails with [`crate::DecompressError::MemoryLimitExceeded`], even in
+    /// lenient mode; the error's `limit` is this total.
+    ///
+    /// `None` (the default) applies no aggregate limit. Every load starts with
+    /// a fresh budget.
+    pub max_total_decompressed_size: Option<usize>,
 }
 
 impl std::fmt::Debug for LoadOptions {
@@ -58,6 +72,7 @@ impl std::fmt::Debug for LoadOptions {
             .field("filter", &self.filter.map(|_| "fn(..)"))
             .field("strict", &self.strict)
             .field("max_decompressed_size", &self.max_decompressed_size)
+            .field("max_total_decompressed_size", &self.max_total_decompressed_size)
             .finish()
     }
 }
@@ -85,6 +100,17 @@ impl LoadOptions {
     pub fn with_max_decompressed_size(max_decompressed_size: usize) -> Self {
         Self {
             max_decompressed_size: Some(max_decompressed_size),
+            ..Default::default()
+        }
+    }
+
+    /// Create options that bound the total number of bytes every stream may
+    /// decompress to during one load, to defend against PDFs made of many
+    /// individually small decompression bombs.
+    /// See [`LoadOptions::max_total_decompressed_size`].
+    pub fn with_max_total_decompressed_size(max_total_decompressed_size: usize) -> Self {
+        Self {
+            max_total_decompressed_size: Some(max_total_decompressed_size),
             ..Default::default()
         }
     }

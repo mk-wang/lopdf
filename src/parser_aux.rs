@@ -534,13 +534,18 @@ pub fn decode_xref_stream(stream: Stream) -> Result<(Xref, Dictionary)> {
 /// behavior of [`decode_xref_stream`]). Cross-reference streams are decoded
 /// early during loading, so this bounds the memory a `/XRef` stream can use.
 pub fn decode_xref_stream_with_limit(
-    mut stream: Stream, max_decompressed_size: Option<usize>,
+    stream: Stream, max_decompressed_size: Option<usize>,
+) -> Result<(Xref, Dictionary)> {
+    decode_xref_stream_with_budget(stream, max_decompressed_size, None)
+}
+
+/// Decode a cross-reference stream while charging its decoded bytes against the
+/// per-load aggregate budget.
+pub(crate) fn decode_xref_stream_with_budget(
+    mut stream: Stream, max_decompressed_size: Option<usize>, budget: Option<&crate::object::DecompressionBudget>,
 ) -> Result<(Xref, Dictionary)> {
     if stream.is_compressed() {
-        match max_decompressed_size {
-            Some(max) => stream.decompress_with_limit(max)?,
-            None => stream.decompress()?,
-        }
+        stream.decompress_with_budget(max_decompressed_size, budget)?;
     }
     let mut dict = stream.dict;
     let mut reader = Cursor::new(stream.content);
